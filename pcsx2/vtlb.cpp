@@ -19,6 +19,7 @@
 #include "Common.h"
 #include "vtlb.h"
 #include "vtlbPageRuns.h"
+#include "vtlbProtection.h"
 #include "COP0.h"
 #include "Cache.h"
 #include "IopMem.h"
@@ -90,6 +91,10 @@ static std::vector<u32> s_fastmem_virtual_mapping; // maps vaddr -> mainmem offs
 static std::unordered_multimap<u32, u32> s_fastmem_physical_mapping; // maps mainmem offset -> vaddr
 static std::unordered_map<uptr, LoadstoreBackpatchInfo> s_fastmem_backpatch_info;
 static std::vector<u32> s_fastmem_faulting_pcs; // sorted; lookups via binary search
+
+// Initialized before mappings or fault handlers are installed in vtlb_Core_Alloc.
+// Never query the OS or initialize a local static from the fault handler.
+static vtlbProtection::Granularity s_protection_granularity{};
 
 // Sticky: the 4 GB fastmem area allocation failed on this device at least once.
 // Process-lifetime flag so LoadSettings's config reload can't silently re-enable
@@ -841,14 +846,6 @@ static constexpr bool vtlb_MismatchedHostPageSize()
 	return (__pagesize != VTLB_PAGE_SIZE);
 }
 
-static bool vtlb_IsHostAligned(u32 paddr)
-{
-	if constexpr (!vtlb_MismatchedHostPageSize())
-		return true;
-
-	return ((paddr & __pagemask) == 0);
-}
-
 static u32 vtlb_HostPage(u32 page)
 {
 	if constexpr (!vtlb_MismatchedHostPageSize())
@@ -967,6 +964,7 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 	if (s_fastmem_virtual_mapping[page] != NO_FASTMEM_MAPPING)
 	{
 		// current mapping needs to be removed
+		const u32 old_mainmem_offset = s_fastmem_virtual_mapping[page];
 		const bool was_coalesced = vtlb_IsHostCoalesced(page);
 
 		s_fastmem_virtual_mapping[page] = NO_FASTMEM_MAPPING;
@@ -974,7 +972,7 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 			Console.Error("Failed to unmap vaddr %08X", vaddr);
 
 		// remove reverse mapping
-		auto range = s_fastmem_physical_mapping.equal_range(mainmem_offset);
+		auto range = s_fastmem_physical_mapping.equal_range(old_mainmem_offset);
 		for (auto it = range.first; it != range.second;)
 		{
 			auto this_it = it++;
@@ -995,6 +993,24 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 			Console.Error("Failed to map vaddr %08X to mainmem offset %08X", vtlb_HostAlignOffset(vaddr), host_offset);
 			s_fastmem_virtual_mapping[page] = NO_FASTMEM_MAPPING;
 			return;
+		}
+
+		// A mapping still spans __pagesize, but its SMC permissions can differ
+		// between runtime pages. Restore every sub-page after a map/remap; using
+		// only the last guest page's mode could make protected code writable.
+		if (s_protection_granularity.size < __pagesize &&
+			host_offset >= HostMemoryMap::EEmemOffset &&
+			(host_offset - HostMemoryMap::EEmemOffset) < Ps2MemSize::ExposedRam)
+		{
+			for (u32 offset = 0; offset < __pagesize; offset += s_protection_granularity.size)
+			{
+				const bool writable = mmap_GetRamPageInfo(host_offset - HostMemoryMap::EEmemOffset + offset) != ProtMode_Write;
+				if (writable != mode.CanWrite())
+				{
+					HostSys::MemProtect(s_fastmem_area->PagePointer(host_page) + offset,
+						s_protection_granularity.size, PageAccess_ReadOnly().Write(writable));
+				}
+			}
 		}
 	}
 
@@ -1140,8 +1156,11 @@ void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
 			{
 				FASTMEM_LOG("  valias %08X (size %u)", it->second, VTLB_PAGE_SIZE);
 
-				if (vtlb_IsHostAligned(it->second))
-					HostSys::MemProtect(s_fastmem_area->OffsetPointer(it->second), __pagesize, prot);
+				if (s_protection_granularity.IsAligned(it->second) &&
+					vtlb_IsHostCoalesced(it->second / VTLB_PAGE_SIZE))
+				{
+					HostSys::MemProtect(s_fastmem_area->OffsetPointer(it->second), s_protection_granularity.size, prot);
+				}
 			}
 		}
 		return;
@@ -1166,12 +1185,13 @@ void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
 		{
 			FASTMEM_LOG("  valias %08X (size %u)", it->second, VTLB_PAGE_SIZE);
 
-			if (vtlb_IsHostAligned(it->second))
+			if (s_protection_granularity.IsAligned(it->second) &&
+				vtlb_IsHostCoalesced(it->second / VTLB_PAGE_SIZE))
 				offsets.push_back(it->second);
 		}
 	}
 
-	for (const vtlbPageRuns::Run& run : vtlbPageRuns::Build(offsets, __pagesize))
+	for (const vtlbPageRuns::Run& run : vtlbPageRuns::Build(offsets, s_protection_granularity.size))
 		HostSys::MemProtect(s_fastmem_area->OffsetPointer(run.start), run.size, prot);
 }
 
@@ -1412,6 +1432,17 @@ void vtlb_ResetFastmem()
 //    default is used.
 bool vtlb_Core_Alloc()
 {
+	// GetRuntimePageSize needs no VM/JIT state (also used by the early hardware
+	// check and arm64 instruction patching). Cache a validated value before any
+	// protection lookup, including for callers which skip the frontend check.
+	static const auto granularity = vtlbProtection::GetGranularity(HostSys::GetRuntimePageSize());
+	if (!granularity)
+	{
+		Console.Error("Unsupported or unknown runtime host page size; refusing to initialize vtlb.");
+		return false;
+	}
+	s_protection_granularity = *granularity;
+
 	static constexpr size_t VMAP_SIZE = sizeof(VTLBVirtual) * VTLB_VMAP_ITEMS;
 	static_assert(HostMemoryMap::VTLBVirtualMapSize == VMAP_SIZE);
 
@@ -1532,12 +1563,8 @@ void vtlb_Core_Free()
 // back to protected], so that blocks which underwent a single invalidation don't need to
 // incur a permanent performance penalty.
 //
-// Page Granularity:
-// Fortunately for us MIPS and x86 use the same page granularity for TLB and memory
-// protection, so we can use a 1:1 correspondence when protecting pages.  Page granularity
-// is 4096 (4k), which is why you'll see a lot of 0xfff's, >><< 12's, and 0x1000's in the
-// code below.
-//
+// SMC protection follows the runtime kernel page size. Guest translation remains
+// VTLB_PAGE_SIZE (4K), while mappings/reservations keep compile-time __pagesize.
 
 struct vtlb_PageProtectionInfo
 {
@@ -1551,7 +1578,7 @@ struct vtlb_PageProtectionInfo
 	vtlb_ProtectionMode Mode;
 };
 
-alignas(16) static vtlb_PageProtectionInfo m_PageProtectInfo[Ps2MemSize::TotalRam >> __pageshift];
+alignas(16) static vtlb_PageProtectionInfo m_PageProtectInfo[Ps2MemSize::TotalRam >> vtlbProtection::MIN_PAGE_SHIFT];
 
 
 // returns:
@@ -1562,7 +1589,7 @@ vtlb_ProtectionMode mmap_GetRamPageInfo(u32 paddr)
 {
 	pxAssert(eeMem);
 
-	paddr &= ~0xfff;
+	paddr &= ~VTLB_PAGE_MASK;
 
 	uptr ptr = (uptr)PSM(paddr);
 	uptr rampage = ptr - (uptr)eeMem->Main;
@@ -1570,7 +1597,7 @@ vtlb_ProtectionMode mmap_GetRamPageInfo(u32 paddr)
 	if (!ptr || rampage >= Ps2MemSize::ExposedRam)
 		return ProtMode_NotRequired; //not in ram, no tracking done ...
 
-	rampage >>= __pageshift;
+	rampage = s_protection_granularity.Index(rampage);
 
 	return m_PageProtectInfo[rampage].Mode;
 }
@@ -1580,7 +1607,7 @@ void mmap_MarkCountedRamPage(u32 paddr)
 {
 	pxAssert(eeMem);
 
-	paddr &= ~__pagemask;
+	paddr = s_protection_granularity.Align(paddr);
 
 	// Same story as the fault handler: anything PSM resolves outside main RAM is
 	// ROM or VU memory, which is never under EE write protection, so there is
@@ -1594,7 +1621,7 @@ void mmap_MarkCountedRamPage(u32 paddr)
 	if (!ptr || rampage >= Ps2MemSize::ExposedRam)
 		return;
 
-	rampage >>= __pageshift;
+	rampage = s_protection_granularity.Index(rampage);
 
 	// Important: Update the ReverseRamMap here because TLB changes could alter the paddr
 	// mapping into eeMem->Main.
@@ -1607,12 +1634,12 @@ void mmap_MarkCountedRamPage(u32 paddr)
 	eeRecPerfLog.Write((m_PageProtectInfo[rampage].Mode == ProtMode_Manual) ?
 						   "Re-protecting page @ 0x%05x" :
 						   "Protected page @ 0x%05x",
-		paddr >> __pageshift);
+		paddr >> s_protection_granularity.shift);
 
 	m_PageProtectInfo[rampage].Mode = ProtMode_Write;
-	HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadOnly());
+	HostSys::MemProtect(&eeMem->Main[rampage << s_protection_granularity.shift], s_protection_granularity.size, PageAccess_ReadOnly());
 	// Narrowing is safe, the bound above keeps this under ExposedRam.
-	vtlb_UpdateFastmemProtection(static_cast<u32>(rampage << __pageshift), __pagesize, PageAccess_ReadOnly());
+	vtlb_UpdateFastmemProtection(static_cast<u32>(rampage << s_protection_granularity.shift), s_protection_granularity.size, PageAccess_ReadOnly());
 }
 
 // offset - offset of address relative to psM.
@@ -1622,17 +1649,18 @@ static __fi void mmap_ClearCpuBlock(uint offset)
 {
 	pxAssert(eeMem);
 
-	int rampage = offset >> __pageshift;
+	const u32 rampage = s_protection_granularity.Index(offset);
 
 	// Assertion: This function should never be run on a block that's already under
 	// manual protection.  Indicates a logic error in the recompiler or protection code.
 	pxAssertMsg(m_PageProtectInfo[rampage].Mode != ProtMode_Manual,
 		"Attempted to clear a block that is already under manual protection.");
 
-	HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadWrite());
-	vtlb_UpdateFastmemProtection(rampage << __pageshift, __pagesize, PageAccess_ReadWrite());
+	HostSys::MemProtect(&eeMem->Main[rampage << s_protection_granularity.shift], s_protection_granularity.size, PageAccess_ReadWrite());
+	vtlb_UpdateFastmemProtection(rampage << s_protection_granularity.shift, s_protection_granularity.size, PageAccess_ReadWrite());
 	m_PageProtectInfo[rampage].Mode = ProtMode_Manual;
-	Cpu->Clear(m_PageProtectInfo[rampage].ReverseRamMap, __pagesize);
+	// Cpu::Clear takes a count of 32-bit instruction words, not bytes.
+	Cpu->Clear(m_PageProtectInfo[rampage].ReverseRamMap, s_protection_granularity.size / sizeof(u32));
 }
 
 PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exception_pc, void* fault_address, bool is_write)
@@ -1654,7 +1682,7 @@ PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exceptio
 		uptr ptr = (uptr)PSM(vaddr);
 		uptr offset = (ptr - (uptr)eeMem->Main);
 		if (ptr && offset < Ps2MemSize::ExposedRam &&
-			m_PageProtectInfo[offset >> __pageshift].Mode == ProtMode_Write)
+			m_PageProtectInfo[s_protection_granularity.Index(offset)].Mode == ProtMode_Write)
 		{
 			// fprintf(stderr, "Not backpatching code write at %08X\n", vaddr);
 			mmap_ClearCpuBlock(offset);
@@ -1673,8 +1701,11 @@ PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exceptio
 	{
 		// get bad virtual address
 		uptr offset = reinterpret_cast<uptr>(fault_address) - reinterpret_cast<uptr>(eeMem->Main);
-		if (offset >= Ps2MemSize::ExposedRam)
+		if (offset >= Ps2MemSize::ExposedRam ||
+			m_PageProtectInfo[s_protection_granularity.Index(offset)].Mode != ProtMode_Write)
+		{
 			return HandlerResult::ExecuteNextHandler;
+		}
 
 		mmap_ClearCpuBlock(offset);
 		return HandlerResult::ContinueExecution;

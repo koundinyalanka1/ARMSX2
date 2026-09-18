@@ -15,6 +15,7 @@
 // an mprotect that silently fails somewhere inside fastmem much later.
 
 #include "common/HostSys.h"
+#include "vtlbProtection.h"
 
 #include <gtest/gtest.h>
 
@@ -67,4 +68,42 @@ TEST(HostPageSize, AgreesWithTheRunningKernelOnThisHost)
 	ASSERT_GT(runtime, 0u);
 	EXPECT_TRUE(HostSys::IsRuntimePageSizeCompatible(runtime))
 		<< "compiled for " << __pagesize << ", kernel reports " << runtime;
+}
+
+TEST(HostPageSize, LargeBuildTracksFourIndependentSmallKernelPages)
+{
+	const auto granularity = vtlbProtection::GetGranularity(4096, 16384);
+	ASSERT_TRUE(granularity);
+	EXPECT_EQ(granularity->size, 4096u);
+	EXPECT_EQ(granularity->shift, 12u);
+	for (u32 page = 0; page < 4; page++)
+	{
+		SCOPED_TRACE(page);
+		EXPECT_EQ(granularity->Index(page * 4096 + 4095), page);
+		EXPECT_EQ(granularity->Align(page * 4096 + 4095), page * 4096);
+		EXPECT_TRUE(granularity->IsAligned(page * 4096));
+	}
+	// The last byte of RAM must fit the table sized for the finest granularity.
+	constexpr u32 ram_size = 32 * 1024 * 1024;
+	EXPECT_EQ(granularity->Index(ram_size - 1), (ram_size >> vtlbProtection::MIN_PAGE_SHIFT) - 1);
+}
+
+TEST(HostPageSize, MatchingKernelRetainsItsProtectionGranularity)
+{
+	for (const u32 size : {4096u, 16384u})
+	{
+		const auto granularity = vtlbProtection::GetGranularity(size, size);
+		ASSERT_TRUE(granularity);
+		EXPECT_EQ(granularity->size, size);
+		EXPECT_EQ(granularity->Index(size - 1), 0u);
+		EXPECT_EQ(granularity->Index(size), 1u);
+		EXPECT_EQ(granularity->Align(size + 4095), size);
+	}
+}
+
+TEST(HostPageSize, ProtectionRefusesUnknownOrUnsupportedKernelPages)
+{
+	for (const size_t runtime : {0u, 1024u, 3072u, 8193u, 32768u})
+		EXPECT_FALSE(vtlbProtection::GetGranularity(runtime, 16384));
+	EXPECT_FALSE(vtlbProtection::GetGranularity(16384, 4096));
 }

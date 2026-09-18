@@ -13,6 +13,7 @@
 // off for them.
 
 #include "vtlbPageRuns.h"
+#include "vtlbProtection.h"
 
 #include <gtest/gtest.h>
 
@@ -41,6 +42,37 @@ namespace
 		return std::set<u64>(offsets.begin(), offsets.end());
 	}
 } // namespace
+
+TEST(VtlbPageRuns, LargeBuildProtectsOnlyFaultingRuntimePageAndItsAliases)
+{
+	const auto granularity = vtlbProtection::GetGranularity(4096, 16384);
+	ASSERT_TRUE(granularity);
+	// All four sub-pages must be eligible, not just the 16K-aligned first one.
+	for (u32 subpage = 0; subpage < 16384; subpage += 4096)
+	{
+		std::vector<u32> offsets = {subpage, 0x80000000u + subpage, 0xa0000000u + subpage};
+		for (const u32 offset : offsets)
+			ASSERT_TRUE(granularity->IsAligned(offset));
+		const auto expected = ExpectedPages(offsets);
+		const auto runs = vtlbPageRuns::Build(offsets, granularity->size);
+		ASSERT_EQ(runs.size(), 3u);
+		EXPECT_EQ(CoveredBytes(runs), expected);
+		for (const auto& run : runs)
+			EXPECT_EQ(run.size, 4096u);
+	}
+}
+
+TEST(VtlbPageRuns, LargeBuildDoesNotProtectSmallKernelPagesInGaps)
+{
+	const auto granularity = vtlbProtection::GetGranularity(4096, 16384);
+	ASSERT_TRUE(granularity);
+	std::vector<u32> offsets = {0x1000, 0x2000, 0x4000, 0xfffff000};
+	const auto expected = ExpectedPages(offsets);
+	const auto runs = vtlbPageRuns::Build(offsets, granularity->size);
+	ASSERT_EQ(runs.size(), 3u);
+	EXPECT_EQ(CoveredBytes(runs), expected);
+	EXPECT_EQ(runs.back().start + runs.back().size, 0x100000000ULL);
+}
 
 TEST(VtlbPageRuns, MergesAContiguousSweepIntoOneCall)
 {

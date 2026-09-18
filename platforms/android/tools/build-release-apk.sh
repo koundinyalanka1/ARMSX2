@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARMSX2 sideload RELEASE APK (com.armsx2) — dual-core (4k + 16k page size),
+# ARMSX2 sideload RELEASE APK (com.armsx2) — one core for 4K and 16K kernels,
 # PGO=optimize, ROTATION-signed. This is the real distribution recipe; the
 # sibling build-universal-page-apk.sh is only a debug/no-PGO smoke-test builder.
 #
@@ -99,22 +99,20 @@ build_core() { # pagesize libname outapk
 	cp -f "$BUILT" "$outapk"
 }
 
-build_core 0x1000 emucore_4k  "$WORK/base-4k.apk"
-[[ -n "${ONLY_4K:-}" ]] || build_core 0x4000 emucore_16k "$WORK/base-16k.apk"
+build_core 0x4000 emucore "$WORK/base.apk"
 
-unzip -p "$WORK/base-4k.apk"  lib/arm64-v8a/libemucore_4k.so  > "$WORK/lib-stage/lib/arm64-v8a/libemucore_4k.so"
-[[ -n "${ONLY_4K:-}" ]] || unzip -p "$WORK/base-16k.apk" lib/arm64-v8a/libemucore_16k.so > "$WORK/lib-stage/lib/arm64-v8a/libemucore_16k.so"
-for so in libemucore_4k $([[ -z "${ONLY_4K:-}" ]] && echo libemucore_16k); do
+unzip -p "$WORK/base.apk" lib/arm64-v8a/libemucore.so > "$WORK/lib-stage/lib/arm64-v8a/libemucore.so"
+for so in libemucore; do
 	sz=$(stat -f%z "$WORK/lib-stage/lib/arm64-v8a/$so.so")
 	echo "  $so.so = $((sz/1024/1024)) MB"
 	[[ "$sz" -gt 10000000 ]] || { echo "FATAL $so too small ($sz)" >&2; exit 1; }
 done
 
-# merge: 4k release apk as base, drop old signatures + both cores, re-add both cores STORED
+# Repack the universal core STORED, then align and sign.
 UNSIGNED="$WORK/universal-unsigned.apk"; ALIGNED="$WORK/universal-aligned.apk"
-cp -f "$WORK/base-4k.apk" "$UNSIGNED"
+cp -f "$WORK/base.apk" "$UNSIGNED"
 zip -qd "$UNSIGNED" "META-INF/*" >/dev/null 2>&1 || true
-zip -qd "$UNSIGNED" "lib/arm64-v8a/libemucore_4k.so" "lib/arm64-v8a/libemucore_16k.so" >/dev/null 2>&1 || true
+zip -qd "$UNSIGNED" "lib/arm64-v8a/libemucore*.so" >/dev/null 2>&1 || true
 ( cd "$WORK/lib-stage" && zip -qr -0 "$UNSIGNED" lib )
 "$ZIPALIGN" -f -P 16 4 "$UNSIGNED" "$ALIGNED"
 
@@ -128,8 +126,8 @@ rm -f "$OUTPUT_APK"
 	--in "$ALIGNED" --out "$OUTPUT_APK"
 
 echo; echo "================= VERIFY ================="
-echo "-- both cores present --"
-unzip -l "$OUTPUT_APK" | grep -E "libemucore_(4k|16k)\.so" || { echo "FATAL cores missing" >&2; exit 1; }
+echo "-- universal core present --"
+unzip -l "$OUTPUT_APK" | grep -E "libemucore\.so" || { echo "FATAL core missing" >&2; exit 1; }
 echo "-- Discord Social SDK --"
 # ★ The SDK is resolved from $DISCORD_SDK_DIR at configure time and gated only on
 # include/discordpp.h existing, so with the variable unset the build simply omits Discord --

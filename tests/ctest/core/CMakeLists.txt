@@ -10,6 +10,7 @@ add_pcsx2_test(core_test
 	host_page_size_tests.cpp
 	libretro_memory_map_tests.cpp
 	vtlb_page_runs_tests.cpp
+	vtlb_smc_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )

@@ -30,14 +30,11 @@ on:
         default: false
       pageSize:
         description: >-
-          Compile-time host page size for the core, in bytes. A core is one
-          binary, so it serves exactly the kernels whose page size divides
-          this one - which is why both variants get built rather than one 16K
-          core for everybody. See the ANDROID branch in
-          cmake/BuildParameters.cmake for what the larger page costs.
+          Compile-time mapping alignment. The default 16K core runs on both
+          4K and 16K kernels, with SMC protection at the runtime page size.
         required: false
         type: string
-        default: "4096"
+        default: "16384"
 
 jobs:
   build_libretro:
@@ -110,12 +107,7 @@ jobs:
         run: |
           # The libretro core is a position-independent shared object driven by
           # the frontend's Vulkan context — no Qt, no SDL, no X11/Wayland WSI.
-          # The page size comes from the caller so each kernel page size gets
-          # its own core: a build runs on the kernels whose page size divides
-          # its own (HostSys::IsRuntimePageSizeCompatible), and a 16K core
-          # would serve both but put four times the RAM under ProtMode_Manual.
-          # A frontend picks the matching file at load time, the way the APK
-          # picks between libemucore_4k.so and libemucore_16k.so.
+          # Mapping alignment remains compiled in; SMC uses the kernel page size.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
@@ -138,7 +130,7 @@ jobs:
             -DX11_API=OFF \
             -DWAYLAND_API=OFF \
             -DDISABLE_ADVANCE_SIMD=TRUE \
-            -DOVERRIDE_HOST_PAGE_SIZE=${{ inputs.pageSize }} \
+            -DHOST_PAGE_SIZE=${{ inputs.pageSize }} \
             -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
       - name: Build armsx2_libretro

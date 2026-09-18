@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# ci-nightly-dualcore.sh — GitHub Actions dual-core (4k + 16k) + PGO nightly.
-# ----------------------------------------------------------------------------
-# A stock `./gradlew :app:assembleRelease` produces ONE core at the default
-# host page size (emucore_4k @ 0x1000). That APK cannot load its native core on
-# 16k-page devices (Android 15+ handhelds), so half the fleet is broken.
-#
-# PCSX2 fastmem bakes the host page size in at compile time, so a universal APK
-# needs the core compiled TWICE (0x1000 and 0x4000) and both .so's merged into
-# one APK — exactly what tools/build-release-apk.sh does for hand-built
-# releases. This is the CI-portable (Linux, no macOS assumptions) version of
-# that recipe, plus PGO=optimize so the nightly matches release performance.
+# ci-nightly-dualcore.sh — universal 16K-aligned core + PGO nightly.
+# The historical script name is retained for existing CI callers. SMC protection
+# uses runtime pages, so one core serves both 4K and 16K kernels.
 #
 # Runs from platforms/android (the gradle root); the nightly workflow sets
 # working-directory accordingly.
@@ -82,20 +74,19 @@ build_core() { # pagesize libname
 	unzip -p "$BUILT" "lib/arm64-v8a/lib${ln}.so" > "$WORK/lib-stage/lib/arm64-v8a/lib${ln}.so"
 }
 
-build_core 0x1000 emucore_4k
-build_core 0x4000 emucore_16k
+build_core 0x4000 emucore
 
-for so in emucore_4k emucore_16k; do
+for so in emucore; do
 	sz="$(fsize "$WORK/lib-stage/lib/arm64-v8a/lib${so}.so")"
 	echo "  lib${so}.so = $(( sz / 1024 / 1024 )) MB"
 	[[ "$sz" -gt 10000000 ]] || { echo "FATAL: lib${so}.so too small ($sz bytes)" >&2; exit 1; }
 done
 
-# --- merge: 4k APK as base, drop old signatures + both cores, re-add STORED ---
+# --- Repack the universal core STORED for direct loading, then align/sign ---
 UNS="$WORK/universal-unsigned.apk"; ALN="$WORK/universal-aligned.apk"
-cp -f "$WORK/base-emucore_4k.apk" "$UNS"
+cp -f "$WORK/base-emucore.apk" "$UNS"
 zip -qd "$UNS" "META-INF/*" >/dev/null 2>&1 || true
-zip -qd "$UNS" "lib/arm64-v8a/libemucore_4k.so" "lib/arm64-v8a/libemucore_16k.so" >/dev/null 2>&1 || true
+zip -qd "$UNS" "lib/arm64-v8a/libemucore*.so" >/dev/null 2>&1 || true
 ( cd "$WORK/lib-stage" && zip -qr -0 "$UNS" lib )
 "$ZIPALIGN" -f -P 16 4 "$UNS" "$ALN"
 
@@ -135,8 +126,8 @@ else
 fi
 
 echo; echo "================= VERIFY ================="
-echo "-- both cores present --"
-unzip -l "$OUT" | grep -E "libemucore_(4k|16k)\.so" || { echo "FATAL: cores missing" >&2; exit 1; }
+echo "-- universal core present --"
+unzip -l "$OUT" | grep -E "libemucore\.so" || { echo "FATAL: core missing" >&2; exit 1; }
 echo "-- 16k alignment --"; "$ZIPALIGN" -c -P 16 4 "$OUT" && echo "  align OK"
 echo "-- signature --"; "$APKSIGNER" verify "$OUT" && echo "  sig OK"
 [[ -x "$AAPT" ]] && "$AAPT" dump badging "$OUT" 2>/dev/null | grep -E "package: name|versionCode|versionName" | head -2

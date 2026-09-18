@@ -162,33 +162,13 @@ elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_CACHE_LINE_SIZE=${HOST_CACHE_LINE_SIZE})
 	endif()
 
-	# Android is neither LINUX nor WIN32 to CMake, so without this branch it
-	# falls through to the ARM64 default in Pcsx2Defs.h. Detection is not an
-	# option here (cross-compile), so it is a knob, defaulted to 4K and named
-	# the same as in the APK's own copy of this file.
-	#
-	# 4K, and not 16K, even though a 16K build now runs on a 4K kernel too
-	# (HostSys::IsRuntimePageSizeCompatible). One binary for both page sizes is
-	# tempting and it is the wrong trade, because __pagesize is not only the
-	# mmap granularity: m_PageProtectInfo is indexed by it, so on a 16K build
-	# every SMC fault clears the recompiled blocks of a 16K span instead of a
-	# 4K one and flips that whole span to ProtMode_Manual — and a Manual page's
-	# blocks re-verify their source words inline on every execution. Four times
-	# the RAM under that tax, on devices that did not need it: 16K kernels are
-	# new-flagship territory, while the phones that most need the performance
-	# are all 4K.
-	#
-	# So each page size gets its own build, and the packaging picks between
-	# them: the APK ships libemucore_4k.so and libemucore_16k.so and chooses at
-	# runtime (NativeApp.getRuntimePageSize), and the libretro core is built
-	# twice the same way.
+	# One 16K-aligned arm64 binary runs on 4K and 16K kernels. SMC tracking and
+	# protection follow the runtime page size, so 4K phones retain 4K invalidation.
 	if(ANDROID)
-		set(ARMSX2_ANDROID_HOST_PAGE_SIZE "0x1000" CACHE STRING "Compile-time Android host page size for the PCSX2 core")
+		set(ARMSX2_ANDROID_HOST_PAGE_SIZE "0x4000" CACHE STRING "Compile-time Android host page size for the PCSX2 core")
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_PAGE_SIZE=${ARMSX2_ANDROID_HOST_PAGE_SIZE})
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_CACHE_LINE_SIZE=64)
-		# 16K-page compatibility for the ELF itself: a 4K-internal-page build
-		# still has to load on a 16K kernel, which requires the segments be
-		# aligned to 16K. Independent of the page size above.
+		# ELF segments must also be aligned for 16K kernels.
 		add_link_options(
 			"LINKER:-z,max-page-size=16384"
 			"LINKER:-z,common-page-size=16384"

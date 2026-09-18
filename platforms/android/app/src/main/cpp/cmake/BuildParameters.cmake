@@ -156,11 +156,8 @@ elseif("${_PCSX2_TARGET_PROCESSOR}" STREQUAL "arm64" OR "${_PCSX2_TARGET_PROCESS
 	endif()
 
 	if(ANDROID)
-		set(ARMSX2_ANDROID_HOST_PAGE_SIZE "0x1000" CACHE STRING "Compile-time Android host page size for the PCSX2 core")
-		# Android 16K-page compatibility requires ELF segment alignment, and the
-		# PCSX2 ARM64 memory manager still needs its compile-time host page size to
-		# match the runtime kernel page size. Universal APK builds compile one
-		# emucore variant with 4K internal pages and one with 16K internal pages.
+		set(ARMSX2_ANDROID_HOST_PAGE_SIZE "0x4000" CACHE STRING "Compile-time Android host page size for the PCSX2 core")
+		# Mapping/ELF alignment serves both kernels; SMC uses runtime pages.
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_PAGE_SIZE=${ARMSX2_ANDROID_HOST_PAGE_SIZE})
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_CACHE_LINE_SIZE=64)
 		add_link_options(

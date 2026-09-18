@@ -7,10 +7,10 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
-val armsx2NativeLibName = providers.gradleProperty("armsx2.nativeLibName").orElse("emucore_4k")
+val armsx2NativeLibName = providers.gradleProperty("armsx2.nativeLibName").orElse("emucore")
 val armsx2Pgo = providers.gradleProperty("armsx2.pgo").orElse("none") // none | generate | optimize
 val armsx2PgoProfile = providers.gradleProperty("armsx2.pgoProfile").orElse("") // abs path to merged .profdata (optimize)
-val armsx2HostPageSize = providers.gradleProperty("armsx2.hostPageSize").orElse("0x1000")
+val armsx2HostPageSize = providers.gradleProperty("armsx2.hostPageSize").orElse("0x4000")
 // --- build target (baseline vs v8.2) -------------------------------------------------------
 // Two artifacts ship per release. The defaults here ARE the baseline build, so an unqualified
 // gradle invocation keeps producing exactly what it always did; the v8.2 target sets all three.
@@ -97,6 +97,7 @@ android {
     ndkVersion = armsx2NdkVersion.get()
 
     defaultConfig {
+        buildConfigField("String", "NATIVE_LIBRARY_NAME", "\"${armsx2NativeLibName.get()}\"")
         applicationId = armsx2ApplicationId.get()
         minSdk = armsx2MinSdk.get().toInt()
         targetSdk = 37

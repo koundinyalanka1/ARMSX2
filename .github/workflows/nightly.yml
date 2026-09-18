@@ -103,7 +103,7 @@ jobs:
             echo "- macOS arm64: macOS-arm64.tar.xz"
             echo "- Linux arm64: Linux-arm64-4K-pages.AppImage on most distros, or the 16K one on Asahi Linux and other Apple Silicon kernels (run getconf PAGESIZE if unsure)"
             echo "- Windows arm64: Windows-arm64.zip"
-            echo "- RetroArch on Linux arm64: Linux-arm64-libretro-core.tar.zst, a 4K-page build"
+            echo "- RetroArch on Linux arm64: Linux-arm64-libretro-core.tar.zst, supports 4K and 16K pages"
             echo "- Bare-display kmsdrm handhelds: Linux-arm64-SDL-handheld.tar.zst, a 4K-page build (Rocknix and Batocera run compositors, so use the Qt AppImage there instead)"
             echo "- Android: Android-arm64.apk, sideload it"
             echo "- iOS: iOS-arm64.ipa, unsigned, sideload it"
@@ -168,36 +168,17 @@ jobs:
       artifactPrefixName: "armsx2-windows-arm64"
       fetchTags: true
 
-  # ---- libretro core + SDL handheld frontend (linux arm64) ---------------
-  # Both were in build-all.yml from the start but never in the nightly, so the
-  # RetroArch core and the kmsdrm handheld build had no published download.
-  # Non-blocking like the mobile jobs. `continue-on-error` is not a permitted key
-  # on a reusable-workflow job, so a failure here still reddens the run -- but the
-  # publish guard below names only the PC jobs, so it costs the asset, not the
-  # release. The SDL build is 4K-page; the core is built once per page size
-  # (see the pageSize matrix below), because one binary for both would put four
-  # times the RAM under ProtMode_Manual on the 4K devices that least afford it.
-  # One core per kernel page size, the same split the Qt job makes above and
-  # the APK makes for its emucore: a core is a single binary, and a 16K build
-  # that covered both would put four times the RAM under ProtMode_Manual on 4K
-  # devices. A frontend loads the file matching sysconf(_SC_PAGESIZE).
+  # ---- libretro core (linux arm64) ---------------------------------------
+  # One 16K build, with runtime SMC protection on both 4K and 16K kernels.
   pc-linux-arm64-libretro:
-    name: PC · Linux arm64 (libretro core, ${{ matrix.pageVariant }} pages)
+    name: PC · Linux arm64 (libretro core, universal pages)
     needs: gate
     if: ${{ needs.gate.outputs.proceed == 'true' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - pageVariant: "4k"
-            pageSize: "4096"
-          - pageVariant: "16k"
-            pageSize: "16384"
     uses: ./.github/workflows/linux_build_libretro.yml
     with:
-      jobName: "libretro Core Build (arm64, ${{ matrix.pageVariant }} pages)"
-      artifactPrefixName: "armsx2-linux-arm64-${{ matrix.pageVariant }}-libretro"
-      pageSize: ${{ matrix.pageSize }}
+      jobName: "libretro Core Build (arm64, universal pages)"
+      artifactPrefixName: "armsx2-linux-arm64-libretro"
+      pageSize: "16384"
       fetchTags: true
     secrets: inherit
 
@@ -253,12 +234,8 @@ jobs:
       - name: Install Rust Android target
         run: rustup target add aarch64-linux-android
 
-      # Dual-core (4k + 16k page size) + PGO nightly. A stock `assembleRelease`
-      # ships ONLY the 4k core and cannot load its native core on 16k-page
-      # devices (Android 15+ handhelds). This compiles the core at both page
-      # sizes and merges both .so's into one APK, with PGO=optimize so the
-      # nightly matches release performance. See tools/ci-nightly-dualcore.sh.
-      - name: Build dual-core (4k + 16k) + PGO APK
+      # A single 16K-aligned core uses runtime SMC pages on both kernels.
+      - name: Build universal core + PGO APK
         env:
           FLAVOR: Github   # sideload build (com.armsx2)
           # Rotation signing so a nightly installs OVER an existing com.armsx2 build.
@@ -296,7 +273,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: armsx2-android-arm64
-          # ONLY the merged dual-core APK — not the intermediate single-core bases —
+          # ONLY the final signed APK — not the intermediate unsigned bases —
           # so the publish job attaches exactly one APK to the release.
           path: platforms/android/app/build/outputs/apk/nightly/*.apk
           if-no-files-found: warn

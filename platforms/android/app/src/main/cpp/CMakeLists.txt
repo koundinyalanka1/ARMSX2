@@ -289,7 +289,7 @@ else()
 	message(STATUS "Discord Social SDK not supplied (DISCORD_SDK_DIR unset) — presence/friends compiled out")
 endif()
 
-set(ARMSX2_EMUCORE_LIBRARY_NAME "emucore_4k" CACHE STRING "Android emucore shared library target/output name")
+set(ARMSX2_EMUCORE_LIBRARY_NAME "emucore" CACHE STRING "Android emucore shared library target/output name")
 
 add_library(${ARMSX2_EMUCORE_LIBRARY_NAME} SHARED
 	native-lib.cpp
@@ -303,13 +303,13 @@ add_library(${ARMSX2_EMUCORE_LIBRARY_NAME} SHARED
 # feature shippable at all, and the linker is where that separation is actually enforced:
 #
 #   libarmsx2_discord.so  -> discord_partner_sdk   (loaded ONLY in the :discord process)
-#   libemucore_*.so       -> no Discord anything
+#   libemucore.so       -> no Discord anything
 #
 # discord_bridge.cpp includes no PCSX2 header, so this target needs none of PCSX2's include paths.
 # If it ever fails to build for want of one, that is the signal that something GPL crept in — fix
 # the include, do not add the path.
 #
-# Verify after any build:  llvm-readelf -d libemucore_4k.so | grep -i discord   (must be empty)
+# Verify after any build:  llvm-readelf -d libemucore.so | grep -i discord   (must be empty)
 if(ARMSX2_HAVE_DISCORD)
 	add_library(armsx2_discord SHARED discord_bridge.cpp)
 	target_link_libraries(armsx2_discord PRIVATE discord_partner_sdk log)

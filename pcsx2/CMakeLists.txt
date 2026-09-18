@@ -213,6 +213,7 @@ set(pcsx2Headers
 	Vif_Unpack.h
 	VMManager.h
 	vtlb.h
+	vtlbProtection.h
 	VU1Trace.h
 	VuEfuModel.h
 	VUflags.h

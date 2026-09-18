@@ -58,7 +58,13 @@ static __ri uint LinuxProt(const PageProtectionMode& mode)
 
 void HostSys::MemProtect(void* baseaddr, size_t size, const PageProtectionMode& mode)
 {
-	pxAssertMsg((size & (__pagesize - 1)) == 0, "Size is page aligned");
+	// Subranges of a larger compile-time mapping can be protected separately.
+	// Cache outside the assertion as well, so release/debug use the same query.
+	static const size_t runtime_page_size = HostSys::GetRuntimePageSize();
+	if (runtime_page_size == 0)
+		AbortWithMessage("Could not determine host page size for mprotect.");
+	pxAssertMsg((size % runtime_page_size) == 0 &&
+		(reinterpret_cast<uptr>(baseaddr) % runtime_page_size) == 0, "Range is runtime page aligned");
 
 	const u32 lnxmode = LinuxProt(mode);
 

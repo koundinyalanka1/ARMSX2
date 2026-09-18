@@ -127,12 +127,9 @@ namespace HostSys
 	/// `runtime_page_size`.
 	///
 	/// Equality is not the requirement - only that the kernel's page size divides the one
-	/// the build was compiled for. Every mapping the emulator makes is a whole number of
-	/// __pagesize units and aligned to one, so on a smaller kernel page those mmap and
-	/// mprotect calls stay legal and correctly aligned: a 16K build simply treats four 4K
-	/// kernel pages as the one page it thinks in. vtlb already works this way whenever
-	/// __pagesize exceeds its own 4K page - the path Apple Silicon has always taken - so
-	/// the coarser protection granularity costs some fastmem churn and nothing else.
+	/// the build was compiled for. Mappings and reservations use __pagesize alignment;
+	/// SMC protection and block tracking use the runtime page size so a 16K build does
+	/// not broaden protection or invalidation on a 4K kernel.
 	///
 	/// The reverse genuinely cannot work: a 4K build protects sub-ranges of a 16K kernel
 	/// page, which the kernel has no way to express.

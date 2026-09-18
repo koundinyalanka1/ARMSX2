@@ -16,6 +16,7 @@ import android.view.InputDevice;
 import android.view.Surface;
 
 import com.armsx2.BiosInfo;
+import com.armsx2.BuildConfig;
 import com.armsx2.EmuState;
 import com.armsx2.runtime.MainActivityRuntime;
 
@@ -24,7 +25,7 @@ import java.lang.ref.WeakReference;
 
 public class NativeApp {
 	static {
-		String libraryName = selectNativeLibraryName();
+		String libraryName = BuildConfig.NATIVE_LIBRARY_NAME;
 		try {
 			System.loadLibrary(libraryName);
 			hasNoNativeBinary = false;
@@ -40,16 +41,11 @@ public class NativeApp {
 	private static long getRuntimePageSize() {
 		try {
 			long pageSize = Os.sysconf(OsConstants._SC_PAGESIZE);
-			return pageSize > 0 ? pageSize : 4096;
+			return pageSize > 0 ? pageSize : 0;
 		} catch (Throwable ignored) {
-			return 4096;
+			return 0;
 		}
 	}
-
-	private static String selectNativeLibraryName() {
-		return getRuntimePageSize() >= 16384 ? "emucore_16k" : "emucore_4k";
-	}
-
 
 	protected static WeakReference<Context> mContext;
 	public static Context getContext() {

@@ -1,10 +1,7 @@
 add_library(pcsx2-libretro SHARED)
 
-# The core name, without the _libretro suffix. A knob because __pagesize is
-# compiled in, so a core serves one kernel page size and each variant needs a
-# file of its own for the frontend to choose between (armsx2 at 4K,
-# armsx2_16k at 16K) - see the ANDROID branch in cmake/BuildParameters.cmake
-# for why one 16K binary for both is the wrong trade.
+# Keep the configurable name and buildbot target for downstream packaging.
+# A 16K build serves both 4K and 16K kernels using runtime SMC granularity.
 set(ARMSX2_LIBRETRO_CORE_NAME "armsx2" CACHE STRING
 	"Base name of the libretro core, before the _libretro suffix")
 

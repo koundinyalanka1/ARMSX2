@@ -23,8 +23,7 @@ while [[ $# -gt 0 ]]; do
 done
 OUTPUT_APK="${OUTPUT_APK:-$HOME/Downloads/ARMSX2-Refresh-UniversalPage-Test.apk}"
 WORK_DIR="$ROOT_DIR/app/build/universal-page-apk"
-BASE_APK="$WORK_DIR/base-4k.apk"
-APK_16K="$WORK_DIR/base-16k.apk"
+BASE_APK="$WORK_DIR/base.apk"
 UNSIGNED_APK="$WORK_DIR/universal-unsigned.apk"
 ALIGNED_APK="$WORK_DIR/universal-aligned.apk"
 LIB_STAGE="$WORK_DIR/lib-stage"
@@ -97,18 +96,14 @@ build_core() {
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" "$LIB_STAGE/lib/arm64-v8a" "$(dirname "$OUTPUT_APK")"
 
-echo "Building 4K emucore..."
-build_core "0x1000" "emucore_4k" "$BASE_APK"
+echo "Building universal 16K-aligned emucore..."
+build_core "0x4000" "emucore" "$BASE_APK"
 
-echo "Building 16K emucore..."
-build_core "0x4000" "emucore_16k" "$APK_16K"
-
-unzip -p "$BASE_APK" "lib/arm64-v8a/libemucore_4k.so" > "$LIB_STAGE/lib/arm64-v8a/libemucore_4k.so"
-unzip -p "$APK_16K" "lib/arm64-v8a/libemucore_16k.so" > "$LIB_STAGE/lib/arm64-v8a/libemucore_16k.so"
+unzip -p "$BASE_APK" "lib/arm64-v8a/libemucore.so" > "$LIB_STAGE/lib/arm64-v8a/libemucore.so"
 
 cp -f "$BASE_APK" "$UNSIGNED_APK"
 zip -qd "$UNSIGNED_APK" "META-INF/*" >/dev/null 2>&1 || true
-zip -qd "$UNSIGNED_APK" "lib/arm64-v8a/libemucore_4k.so" "lib/arm64-v8a/libemucore_16k.so" >/dev/null 2>&1 || true
+zip -qd "$UNSIGNED_APK" "lib/arm64-v8a/libemucore*.so" >/dev/null 2>&1 || true
 
 (cd "$LIB_STAGE" && zip -qr -0 "$UNSIGNED_APK" lib)
 
