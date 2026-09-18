@@ -16,6 +16,7 @@ option(ENABLE_VURUNNER "Enables building pcsx2-vurunner (headless VU microprogra
 option(ENABLE_EERUNNER "Enables building pcsx2-eerunner (headless EE JIT-vs-interpreter divergence localizer) by default.  It can still be built with `make pcsx2-eerunner` otherwise." OFF)
 option(ENABLE_SDL_FRONTEND "Enables building the SDL3 / kmsdrm frontend (pcsx2-sdl) by default.  It can still be built with `make pcsx2-sdl` otherwise." OFF)
 option(ENABLE_LIBRETRO "Build the libretro core (pcsx2-libretro / armsx2_libretro.so). Opt-in: when OFF the subdirectory is not added at all, so it never gets built or installed alongside the Qt/SDL frontends. Reconfigure with -DENABLE_LIBRETRO=ON to build it." OFF)
+option(ARMSX2_VK_DESCRIPTOR_STATS "Count what a content-keyed descriptor cache would save on the Vulkan non-push-descriptor path (Mali and any driver that turned push descriptors off). Measurement only - logs one line per presented frame and is compiled out when OFF." OFF)
 option(LTO_PCSX2_CORE "Enable LTO/IPO/LTCG on the subset of pcsx2 that benefits most from it but not anything else")
 option(USE_VTUNE "Plug VTUNE to profile GS JIT.")
 option(USE_PERF_JITDUMP "Emit Linux perf jitdump (jit-<pid>.dump) for recompiled JIT blocks; use with perf record/inject." OFF)
@@ -355,6 +356,9 @@ endif()
 
 if(USE_VULKAN)
 	list(APPEND PCSX2_DEFS ENABLE_VULKAN)
+	if(ARMSX2_VK_DESCRIPTOR_STATS)
+		list(APPEND PCSX2_DEFS ARMSX2_VK_DESCRIPTOR_STATS=1)
+	endif()
 endif()
 
 if(X11_API)

@@ -3355,6 +3355,12 @@ void GSDeviceVK::EndPresent()
 {
 	RenderImGui();
 
+#if ARMSX2_VK_DESCRIPTOR_STATS
+	// Here rather than in either present branch: this runs once per presented frame on both
+	// the libretro and swapchain paths.
+	ReportTFXDescriptorStats();
+#endif
+
 	VkCommandBuffer cmdbuffer = GetCurrentCommandBuffer();
 	vkCmdEndRenderPass(cmdbuffer);
 	m_is_presenting = false;
@@ -8138,6 +8144,60 @@ __ri void GSDeviceVK::ApplyBaseState(u32 flags, VkCommandBuffer cmdbuf)
 		vkCmdSetLineWidth(cmdbuf, m_current_line_width);
 }
 
+#if ARMSX2_VK_DESCRIPTOR_STATS
+void GSDeviceVK::RecordTFXDescriptorStats()
+{
+	// The contents ApplyTFXState is about to write: every slot's view and layout, plus the
+	// sampler. Two allocations with the same key would have been the same descriptor set, so
+	// the second one is what a cache answers for free. Nothing else in the set varies - the
+	// UBO is a separate set with dynamic offsets.
+	u64 key = 0;
+	for (const GSTextureVK* tex : m_tfx_textures)
+	{
+		HashCombine(key, reinterpret_cast<u64>(tex ? tex->GetView() : VK_NULL_HANDLE),
+			static_cast<u64>(tex ? tex->GetVkLayout() : VK_IMAGE_LAYOUT_UNDEFINED));
+	}
+	HashCombine(key, reinterpret_cast<u64>(m_tfx_sampler));
+
+	m_tfx_ds_stats.allocations++;
+	if (m_tfx_ds_stats.have_last_key && m_tfx_ds_stats.last_key == key)
+		m_tfx_ds_stats.same_as_previous++;
+	if (!m_tfx_ds_stats.keys_this_frame.insert(key).second)
+		m_tfx_ds_stats.seen_before++;
+
+	m_tfx_ds_stats.last_key = key;
+	m_tfx_ds_stats.have_last_key = true;
+}
+
+void GSDeviceVK::ReportTFXDescriptorStats()
+{
+	// Only the fallback path allocates, so a push-descriptor device reports nothing rather
+	// than a page of zeroes.
+	if (m_tfx_ds_stats.allocations == 0)
+		return;
+
+	// same_as_previous is what a one-entry "is this the set I just built?" check would save;
+	// seen_before is the ceiling, what a full per-frame content cache would. If the two are
+	// close, the one-entry version is all that is worth writing.
+	Console.WriteLn("VK TFX descriptors: %llu allocated, %llu same as previous (%.1f%%), "
+					"%llu seen earlier this frame (%.1f%%), %zu distinct",
+		static_cast<unsigned long long>(m_tfx_ds_stats.allocations),
+		static_cast<unsigned long long>(m_tfx_ds_stats.same_as_previous),
+		100.0 * static_cast<double>(m_tfx_ds_stats.same_as_previous) /
+			static_cast<double>(m_tfx_ds_stats.allocations),
+		static_cast<unsigned long long>(m_tfx_ds_stats.seen_before),
+		100.0 * static_cast<double>(m_tfx_ds_stats.seen_before) /
+			static_cast<double>(m_tfx_ds_stats.allocations),
+		m_tfx_ds_stats.keys_this_frame.size());
+
+	m_tfx_ds_stats.allocations = 0;
+	m_tfx_ds_stats.same_as_previous = 0;
+	m_tfx_ds_stats.seen_before = 0;
+	m_tfx_ds_stats.have_last_key = false;
+	m_tfx_ds_stats.keys_this_frame.clear();
+}
+#endif
+
 bool GSDeviceVK::ApplyTFXState(bool already_execed)
 {
 	if (m_current_pipeline_layout == PipelineLayout::TFX && m_dirty_flags == 0)
@@ -8228,6 +8288,9 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		if (!m_use_push_descriptors)
 		{
 			flags |= DIRTY_FLAG_TFX_TEXTURES;
+#if ARMSX2_VK_DESCRIPTOR_STATS
+			RecordTFXDescriptorStats();
+#endif
 			ds = AllocateDescriptorSetFromFramePool(m_tfx_texture_ds_layout);
 			if (ds == VK_NULL_HANDLE) [[unlikely]]
 			{

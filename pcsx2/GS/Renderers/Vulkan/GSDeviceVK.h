@@ -24,6 +24,26 @@
 #include <thread>
 #include <vector>
 
+// Counts what a content-keyed descriptor cache would save on the
+// non-push-descriptor path, so the question can be answered with a measurement
+// rather than a guess. Compiled out entirely unless asked for:
+//
+//   cmake -DARMSX2_VK_DESCRIPTOR_STATS=1 ...
+//
+// Only devices on that path report anything - Mali always, and anything else
+// whose driver made GSDeviceVK turn push descriptors off. ARM's own guidance is
+// that vkAllocateDescriptorSets does not belong in a hot path on Mali, where
+// descriptor pools are not pooled but share one backing allocation, so the
+// per-draw allocation this measures is the shape they warn about. What the
+// numbers decide is whether enough of those allocations are redundant here to
+// be worth caching.
+#ifndef ARMSX2_VK_DESCRIPTOR_STATS
+#define ARMSX2_VK_DESCRIPTOR_STATS 0
+#endif
+#if ARMSX2_VK_DESCRIPTOR_STATS
+#include <unordered_set>
+#endif
+
 class VKSwapChain;
 
 class GSDeviceVK final : public GSDevice
@@ -938,6 +958,26 @@ private:
 
 	std::array<GSTextureVK*, NUM_TFX_TEXTURES> m_tfx_textures{};
 	VkSampler m_tfx_sampler = VK_NULL_HANDLE;
+
+#if ARMSX2_VK_DESCRIPTOR_STATS
+	// Measurement for the non-push-descriptor path — see RecordTFXDescriptorStats.
+	struct TFXDescriptorStats
+	{
+		u64 allocations = 0;     // sets taken from the frame pool
+		u64 same_as_previous = 0; // ... whose contents matched the set before it
+		u64 seen_before = 0;      // ... whose contents matched any set this frame
+		u64 last_key = 0;
+		bool have_last_key = false;
+		std::unordered_set<u64> keys_this_frame;
+	};
+	TFXDescriptorStats m_tfx_ds_stats;
+
+	/// Keys the descriptor contents ApplyTFXState is about to write and counts how many of
+	/// them a cache would have answered without allocating. Called once per allocation.
+	void RecordTFXDescriptorStats();
+	/// Logs the frame's tally and resets it.
+	void ReportTFXDescriptorStats();
+#endif
 	u32 m_tfx_sampler_sel = 0;
 	VkDescriptorSet m_tfx_ubo_descriptor_set = VK_NULL_HANDLE;
 	VkDescriptorSet m_tfx_texture_descriptor_set = VK_NULL_HANDLE;
