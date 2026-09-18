@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "libretro.h"
+#include "MemoryMap.h"
 
 // libretro_vulkan.h pulls in vulkan.h, which only declares a platform's surface
 // types when that platform's VK_USE_PLATFORM_* macro is already defined. The
@@ -1702,6 +1703,96 @@ RETRO_API void retro_reset(void)
 		VMManager::SetState(VMState::Resetting);
 }
 
+// --------------------------------------------------------------------------------------
+//  RetroAchievements
+// --------------------------------------------------------------------------------------
+// The core does not run an rcheevos client of its own here; the frontend does
+// (RetroArch's cheevos, RetroPal's rc_client wrapper, ...). What such a
+// frontend needs from the core is a way to read PS2 memory, and libretro gives
+// it two, both of which are answered below:
+//
+//   * retro_get_memory_data/size for RETRO_MEMORY_SYSTEM_RAM, the coarse
+//     block every frontend understands. rcheevos' PS2 console map lays its
+//     first two regions - Kernel RAM 0x00000000-0x000FFFFF and System RAM
+//     0x00100000-0x01FFFFFF - straight onto it, so main RAM alone already
+//     covers all but one region of the address space an achievement set can
+//     reference.
+//
+//   * SET_MEMORY_MAPS descriptors, which additionally place the scratchpad at
+//     its real address, 0x70000000, where the third PS2 region lives. Without
+//     a map that region resolves to nothing: a frontend walking the console
+//     map has no way to guess that those 16KB sit 128MB past the start of the
+//     Main array, and the sets that watch the scratchpad can never trigger.
+//
+// Both point into the VM's data reservation. SysMemory::ReserveMemory() claims
+// it on the frontend thread in retro_load_game, before the CPU thread starts,
+// and the addresses hold for as long as the VM lives. eeMem itself is only
+// assigned later, on the CPU thread (memAllocate), so these go through
+// SysMemory::GetEEMem() instead to stay clear of that race - it is the same
+// pointer, minus the wait.
+namespace LibretroCore
+{
+	// Held for the frontend to keep reading: a descriptor array handed to
+	// SET_MEMORY_MAPS must outlive the call.
+	static retro_memory_descriptor s_memory_descriptors[LibretroMemoryMap::kDescriptorCount];
+	static bool s_memory_map_published = false;
+
+	// The EE memory block, or null before the reservation exists. Checking
+	// IsAllocated() is what makes that distinction: GetDataPtr() offsets the
+	// base unconditionally and would hand back a small integer instead.
+	static EEVM_MemoryAllocMess* GetEEMemoryBlock()
+	{
+		if (!SysMemory::IsAllocated())
+			return nullptr;
+
+		return reinterpret_cast<EEVM_MemoryAllocMess*>(SysMemory::GetEEMem());
+	}
+
+	static void PublishMemoryMap()
+	{
+		EEVM_MemoryAllocMess* const mem = GetEEMemoryBlock();
+		if (!mem)
+			return;
+
+		LibretroMemoryMap::Build(mem->Main, mem->Scratch, s_memory_descriptors);
+
+		retro_memory_map map = {};
+		map.descriptors = s_memory_descriptors;
+		map.num_descriptors = LibretroMemoryMap::kDescriptorCount;
+		s_memory_map_published = environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &map);
+
+		if (s_memory_map_published)
+		{
+			log_cb(RETRO_LOG_INFO,
+				"Published PS2 memory map: 32MB main RAM at 0x00000000, 16KB scratchpad at 0x70000000.\n");
+		}
+		else
+		{
+			// Not fatal: a frontend that ignores the map can still reach main
+			// RAM through retro_get_memory_data below. Only the scratchpad is
+			// lost with it.
+			log_cb(RETRO_LOG_WARN,
+				"Frontend refused the PS2 memory map; achievements can still use the "
+				"system-RAM block, without the scratchpad.\n");
+		}
+	}
+
+	// Teardown frees the reservation the descriptors point into, so retract
+	// them first: a frontend that keeps a cheevos session open across a game
+	// change would otherwise read through dangling pointers.
+	static void RevokeMemoryMap()
+	{
+		if (!s_memory_map_published)
+			return;
+
+		retro_memory_map map = {};
+		map.descriptors = s_memory_descriptors;
+		map.num_descriptors = 0;
+		environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &map);
+		s_memory_map_published = false;
+	}
+} // namespace LibretroCore
+
 RETRO_API bool retro_load_game(const struct retro_game_info* game)
 {
 	int format = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -1712,6 +1803,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 	}
 
 	CrashHandler::Install();
+
+	// Tell the frontend its cheevos client has something to talk to here. This
+	// has to be answered before the content is loaded, because that is when a
+	// frontend decides whether to hash the disc and open a session for it.
+	bool supports_achievements = true;
+	environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &supports_achievements);
 
 	if (!LibretroCore::InitializeConfig())
 	{
@@ -1973,6 +2070,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 
 	SysMemory::ReserveMemory();
 
+	// The reservation is what the descriptors address, so this goes after it -
+	// and before the CPU thread starts, so a frontend that asks for memory on
+	// the very first frame already has the map.
+	LibretroCore::PublishMemoryMap();
+
 	LibretroCore::s_cpu_thread = std::thread([params = std::move(params)]() mutable {
 		LibretroCore::CPUThreadMain(std::move(params));
 	});
@@ -2004,6 +2106,10 @@ RETRO_API void retro_unload_game(void)
 
 	VKLibretro::AbortPacing(); // GS thread may be parked in PublishFrame
 #endif
+
+	// Before the VM teardown below releases the memory they point into.
+	LibretroCore::RevokeMemoryMap();
+
 	s_shutdown_requested.store(true, std::memory_order_release);
 	if (VMManager::HasValidVM())
 		VMManager::SetState(VMState::Stopping);
@@ -2307,10 +2413,24 @@ RETRO_API unsigned retro_get_region(void)
 
 RETRO_API void* retro_get_memory_data(unsigned id)
 {
-	return nullptr;
+	// Only system RAM. The PS2 has no flat save-RAM block to hand over - its
+	// saves live in memory card files - and the GS's local memory is on the
+	// GPU, not in a host buffer a frontend could walk.
+	if (id != RETRO_MEMORY_SYSTEM_RAM)
+		return nullptr;
+
+	EEVM_MemoryAllocMess* const mem = LibretroCore::GetEEMemoryBlock();
+	return mem ? mem->Main : nullptr;
 }
 
 RETRO_API size_t retro_get_memory_size(unsigned id)
 {
-	return 0;
+	if (id != RETRO_MEMORY_SYSTEM_RAM)
+		return 0;
+
+	// 32MB, the console's own, rather than the 128MB devkit ceiling the Main
+	// array is sized to: the bytes past 32MB are not part of the address space
+	// rcheevos maps, and reporting them would push its console regions out of
+	// alignment with the real ones.
+	return LibretroCore::GetEEMemoryBlock() ? Ps2MemSize::MainRam : 0;
 }

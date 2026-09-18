@@ -7,6 +7,7 @@ add_pcsx2_test(core_test
 	savestate_legacy_tests.cpp
 	settings_precedence_tests.cpp
 	gsrunner_affinity_tests.cpp
+	libretro_memory_map_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )
@@ -17,6 +18,16 @@ add_pcsx2_test(core_test
 target_include_directories(core_test PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/../../../pcsx2-gsrunner
 )
+
+# libretro_memory_map_tests.cpp checks the core's PS2 memory descriptors against rcheevos'
+# own console map. The descriptors live in a header beside the libretro core, which is opt-in
+# and may not be configured at all, so the test reaches it by path; libretro.h comes from the
+# same header-only target the core uses. (rcheevos' headers already arrive through
+# PCSX2_FLAGS, which links it.)
+target_include_directories(core_test PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../pcsx2-libretro
+)
+target_link_libraries(core_test PRIVATE libretro-headers)
 
 if(ARCH_ARM64)
 	# Phase 0.6: ARM64 JIT toolchain smoke test (emit + execute ARM64 code).
