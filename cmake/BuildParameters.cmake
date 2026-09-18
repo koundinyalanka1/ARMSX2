@@ -162,14 +162,20 @@ elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR
 	endif()
 
 	# Android is neither LINUX nor WIN32 to CMake, so without this branch it
-	# falls through to the ARM64 default in Pcsx2Defs.h — 16K pages — while
-	# every current Android device runs a 4K kernel. The ARM64 memory manager
-	# needs its compile-time page size to match the kernel's at runtime, and a
-	# mismatch is a hard failure on the device, not a build warning. Detection
-	# is not an option here (cross-compile), so it is a knob, defaulted to 4K
-	# and named the same as in the APK's own copy of this file.
+	# falls through to the ARM64 default in Pcsx2Defs.h. Detection is not an
+	# option here (cross-compile), so it is a knob — but 16K, not the 4K that
+	# Android kernels used to be uniformly built with.
+	#
+	# 16K is what makes one APK/core run everywhere. The compile-time page size
+	# has to be one the kernel can express, and a build compiled for the larger
+	# page satisfies both: on a 4K kernel its mappings are simply four kernel
+	# pages at a time (see HostSys::IsRuntimePageSizeCompatible). The reverse is
+	# a hard failure on the device, so a 4K build meets every 16K-page kernel —
+	# Pixel 8 and up, and Android 15 onwards generally — and refuses to start.
+	# The cost on 4K devices is coarser fastmem write protection, which is the
+	# configuration Apple Silicon has always run.
 	if(ANDROID)
-		set(ARMSX2_ANDROID_HOST_PAGE_SIZE "0x1000" CACHE STRING "Compile-time Android host page size for the PCSX2 core")
+		set(ARMSX2_ANDROID_HOST_PAGE_SIZE "0x4000" CACHE STRING "Compile-time Android host page size for the PCSX2 core")
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_PAGE_SIZE=${ARMSX2_ANDROID_HOST_PAGE_SIZE})
 		list(APPEND PCSX2_DEFS OVERRIDE_HOST_CACHE_LINE_SIZE=64)
 		# 16K-page compatibility for the ELF itself: a 4K-internal-page build

@@ -118,7 +118,7 @@ jobs:
             -DX11_API=OFF \
             -DWAYLAND_API=OFF \
             -DDISABLE_ADVANCE_SIMD=TRUE \
-            -DOVERRIDE_HOST_PAGE_SIZE=4096 \
+            -DOVERRIDE_HOST_PAGE_SIZE=16384 \
             -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
       - name: Build armsx2-sdl

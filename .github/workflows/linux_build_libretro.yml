@@ -100,9 +100,11 @@ jobs:
         run: |
           # The libretro core is a position-independent shared object driven by
           # the frontend's Vulkan context — no Qt, no SDL, no X11/Wayland WSI.
-          # OVERRIDE_HOST_PAGE_SIZE=4096 is a first-cut default matching the
-          # common Android/handheld RetroArch target; revisit for 16K-page
-          # devices.
+          # OVERRIDE_HOST_PAGE_SIZE=16384 so the one core binary runs on both
+          # page sizes: the compiled page has to be one the kernel can express,
+          # and only the larger satisfies 4K and 16K kernels alike (see
+          # HostSys::IsRuntimePageSizeCompatible). A 4K core cannot start at all
+          # on a 16K-page device.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
@@ -125,7 +127,7 @@ jobs:
             -DX11_API=OFF \
             -DWAYLAND_API=OFF \
             -DDISABLE_ADVANCE_SIMD=TRUE \
-            -DOVERRIDE_HOST_PAGE_SIZE=4096 \
+            -DOVERRIDE_HOST_PAGE_SIZE=16384 \
             -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
       - name: Build armsx2_libretro

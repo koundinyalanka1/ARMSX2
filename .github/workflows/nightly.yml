@@ -174,7 +174,8 @@ jobs:
   # Non-blocking like the mobile jobs. `continue-on-error` is not a permitted key
   # on a reusable-workflow job, so a failure here still reddens the run -- but the
   # publish guard below names only the PC jobs, so it costs the asset, not the
-  # release. Both are 4K-page builds (see OVERRIDE_HOST_PAGE_SIZE in each).
+  # release. Both are 16K-page builds (see OVERRIDE_HOST_PAGE_SIZE in each),
+  # which is what lets a single binary run on 4K and 16K kernels alike.
   pc-linux-arm64-libretro:
     name: PC · Linux arm64 (libretro core)
     needs: gate
