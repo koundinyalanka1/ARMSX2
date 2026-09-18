@@ -18,6 +18,7 @@
 
 #include "Common.h"
 #include "vtlb.h"
+#include "vtlbPageRuns.h"
 #include "COP0.h"
 #include "Cache.h"
 #include "IopMem.h"
@@ -1123,20 +1124,55 @@ void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
 
 	FASTMEM_LOG("UpdateFastmemProtection %08X mmoffset %08X %08X", paddr, mainmem_start, size);
 
-	u32 current_mainmem = mainmem_start;
 	const u32 num_pages = std::min(size, mainmem_size) / VTLB_PAGE_SIZE;
+
+	// A single page has nothing to coalesce, and this is the path the fastmem fault handler
+	// takes - keep it allocation-free and exactly as it was.
+	static constexpr u32 kCoalesceThreshold = 8;
+	if (num_pages <= kCoalesceThreshold)
+	{
+		u32 current_mainmem = mainmem_start;
+		for (u32 i = 0; i < num_pages; i++, current_mainmem += VTLB_PAGE_SIZE)
+		{
+			// update virtual mapping mapping
+			auto range = s_fastmem_physical_mapping.equal_range(current_mainmem);
+			for (auto it = range.first; it != range.second; ++it)
+			{
+				FASTMEM_LOG("  valias %08X (size %u)", it->second, VTLB_PAGE_SIZE);
+
+				if (vtlb_IsHostAligned(it->second))
+					HostSys::MemProtect(s_fastmem_area->OffsetPointer(it->second), __pagesize, prot);
+			}
+		}
+		return;
+	}
+
+	// Anything larger is a sweep - mmap_ResetBlockTracking hands the whole 32MB of RAM in
+	// one call - and a sweep spent one syscall per page per alias, tens of thousands of them,
+	// before every save-state load and on every VM reset. Gather the aliases first and protect
+	// each contiguous run in one call instead; see vtlbPageRuns.h for why the protected bytes
+	// come out identical.
+	// A plain local, not a reused static: a sweep is rare enough that one allocation is
+	// noise against the syscalls it saves, and this stays free of any question about the
+	// fault handler or another thread re-entering it.
+	std::vector<u32> offsets;
+	offsets.reserve(num_pages);
+
+	u32 current_mainmem = mainmem_start;
 	for (u32 i = 0; i < num_pages; i++, current_mainmem += VTLB_PAGE_SIZE)
 	{
-		// update virtual mapping mapping
 		auto range = s_fastmem_physical_mapping.equal_range(current_mainmem);
 		for (auto it = range.first; it != range.second; ++it)
 		{
 			FASTMEM_LOG("  valias %08X (size %u)", it->second, VTLB_PAGE_SIZE);
 
 			if (vtlb_IsHostAligned(it->second))
-				HostSys::MemProtect(s_fastmem_area->OffsetPointer(it->second), __pagesize, prot);
+				offsets.push_back(it->second);
 		}
 	}
+
+	for (const vtlbPageRuns::Run& run : vtlbPageRuns::Build(offsets, __pagesize))
+		HostSys::MemProtect(s_fastmem_area->OffsetPointer(run.start), run.size, prot);
 }
 
 void vtlb_ClearLoadStoreInfo()

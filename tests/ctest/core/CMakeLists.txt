@@ -9,6 +9,7 @@ add_pcsx2_test(core_test
 	gsrunner_affinity_tests.cpp
 	host_page_size_tests.cpp
 	libretro_memory_map_tests.cpp
+	vtlb_page_runs_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )
