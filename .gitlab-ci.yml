@@ -26,11 +26,13 @@
     # The latter is a compile define the build computes for itself, so passing
     # it here would only set a cache variable nothing reads. HOST_PAGE_SIZE is
     # the one detect_page_size() caches into, and a preset cache entry wins, so
-    # this pins the core instead of inheriting whatever the runner happens to
-    # have. 16K rather than the runner's 4K: one core binary has to run on both
-    # page sizes, and only the larger compiled page can (see
-    # HostSys::IsRuntimePageSizeCompatible). Android is neither - it takes
-    # ARMSX2_ANDROID_HOST_PAGE_SIZE, set in .core-defs-android below.
+    # this pins the core to 4K pages instead of inheriting whatever the runner
+    # happens to have. 4K and not 16K deliberately - a 16K build would run on
+    # both kernels, but it also quadruples the RAM an SMC fault flips to
+    # ProtMode_Manual, and Manual blocks re-verify their source inline on every
+    # execution. See the ANDROID branch in cmake/BuildParameters.cmake.
+    # Android is neither - it takes ARMSX2_ANDROID_HOST_PAGE_SIZE, set in
+    # .core-defs-android below.
     CORE_ARGS: >-
       -DCMAKE_C_COMPILER=clang
       -DCMAKE_CXX_COMPILER=clang++
@@ -49,7 +51,7 @@
       -DX11_API=OFF
       -DWAYLAND_API=OFF
       -DDISABLE_ADVANCE_SIMD=TRUE
-      -DHOST_PAGE_SIZE=16384
+      -DHOST_PAGE_SIZE=4096
       -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
 .core-defs-linux:
@@ -166,7 +168,7 @@
       -DX11_API=OFF
       -DWAYLAND_API=OFF
       -DDISABLE_ADVANCE_SIMD=TRUE
-      -DARMSX2_ANDROID_HOST_PAGE_SIZE=0x4000
+      -DARMSX2_ANDROID_HOST_PAGE_SIZE=0x1000
       -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
   cache:
     key:
@@ -234,7 +236,44 @@ libretro-build-osx-arm64:
 ################################### CELLULAR #################################
 # Android (arm64-v8a). armeabi-v7a is not built - the emulator is 64-bit only -
 # and neither is x86_64, which this fork does not target.
+#
+# Two cores, one per kernel page size. A core is a single binary and
+# __pagesize is baked into it, so each build serves the kernels whose page
+# size divides its own. A 16K core would cover both, but m_PageProtectInfo is
+# indexed by __pagesize: every SMC fault would clear a 16K span of recompiled
+# blocks instead of 4K and flip that whole span to ProtMode_Manual, whose
+# blocks re-verify their source words inline on every execution. That is four
+# times the RAM under that tax on 4K devices - which is most phones, and the
+# slower ones. So the frontend loads the core matching sysconf(_SC_PAGESIZE),
+# the same choice the APK makes between libemucore_4k.so and libemucore_16k.so.
 libretro-build-android-arm64-v8a:
   extends:
     - .libretro-android-cmake-arm64-v8a
     - .core-defs-android
+
+.core-defs-android-16k:
+  extends: .core-defs-android
+  variables:
+    CORENAME: armsx2_16k
+    CORE_ARGS: >-
+      -DCMAKE_PREFIX_PATH=$CI_PROJECT_DIR/.deps
+      -DCMAKE_FIND_ROOT_PATH=$CI_PROJECT_DIR/.deps
+      -DENABLE_LIBRETRO=ON
+      -DENABLE_QT_UI=OFF
+      -DENABLE_SDL_FRONTEND=OFF
+      -DENABLE_GSRUNNER=OFF
+      -DENABLE_TESTS=OFF
+      -DENABLE_RECOMPILER_TEST_HOOKS=OFF
+      -DENABLE_SETCAP=OFF
+      -DUSE_BACKTRACE=OFF
+      -DX11_API=OFF
+      -DWAYLAND_API=OFF
+      -DDISABLE_ADVANCE_SIMD=TRUE
+      -DARMSX2_ANDROID_HOST_PAGE_SIZE=0x4000
+      -DARMSX2_LIBRETRO_CORE_NAME=armsx2_16k
+      -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+
+libretro-build-android-arm64-v8a-16k:
+  extends:
+    - .libretro-android-cmake-arm64-v8a
+    - .core-defs-android-16k

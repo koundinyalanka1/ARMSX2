@@ -77,12 +77,25 @@ jobs:
       buildAppImage: true
 
   # ---- libretro core (linux arm64) ---------------------------------------
+  # One core per kernel page size, the same split the Qt job makes above and
+  # the APK makes for its emucore: a core is a single binary, and a 16K build
+  # that covered both would put four times the RAM under ProtMode_Manual on 4K
+  # devices. A frontend loads the file matching sysconf(_SC_PAGESIZE).
   pc-linux-arm64-libretro:
-    name: PC · Linux arm64 (libretro core)
+    name: PC · Linux arm64 (libretro core, ${{ matrix.pageVariant }} pages)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pageVariant: "4k"
+            pageSize: "4096"
+          - pageVariant: "16k"
+            pageSize: "16384"
     uses: ./.github/workflows/linux_build_libretro.yml
     with:
-      jobName: "libretro Core Build (arm64)"
-      artifactPrefixName: "armsx2-linux-arm64-libretro"
+      jobName: "libretro Core Build (arm64, ${{ matrix.pageVariant }} pages)"
+      artifactPrefixName: "armsx2-linux-arm64-${{ matrix.pageVariant }}-libretro"
+      pageSize: ${{ matrix.pageSize }}
       fetchTags: true
     secrets: inherit
 

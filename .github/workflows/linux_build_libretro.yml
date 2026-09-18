@@ -28,6 +28,16 @@ on:
         required: false
         type: boolean
         default: false
+      pageSize:
+        description: >-
+          Compile-time host page size for the core, in bytes. A core is one
+          binary, so it serves exactly the kernels whose page size divides
+          this one - which is why both variants get built rather than one 16K
+          core for everybody. See the ANDROID branch in
+          cmake/BuildParameters.cmake for what the larger page costs.
+        required: false
+        type: string
+        default: "4096"
 
 jobs:
   build_libretro:
@@ -100,11 +110,12 @@ jobs:
         run: |
           # The libretro core is a position-independent shared object driven by
           # the frontend's Vulkan context — no Qt, no SDL, no X11/Wayland WSI.
-          # OVERRIDE_HOST_PAGE_SIZE=16384 so the one core binary runs on both
-          # page sizes: the compiled page has to be one the kernel can express,
-          # and only the larger satisfies 4K and 16K kernels alike (see
-          # HostSys::IsRuntimePageSizeCompatible). A 4K core cannot start at all
-          # on a 16K-page device.
+          # The page size comes from the caller so each kernel page size gets
+          # its own core: a build runs on the kernels whose page size divides
+          # its own (HostSys::IsRuntimePageSizeCompatible), and a 16K core
+          # would serve both but put four times the RAM under ProtMode_Manual.
+          # A frontend picks the matching file at load time, the way the APK
+          # picks between libemucore_4k.so and libemucore_16k.so.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
@@ -127,7 +138,7 @@ jobs:
             -DX11_API=OFF \
             -DWAYLAND_API=OFF \
             -DDISABLE_ADVANCE_SIMD=TRUE \
-            -DOVERRIDE_HOST_PAGE_SIZE=16384 \
+            -DOVERRIDE_HOST_PAGE_SIZE=${{ inputs.pageSize }} \
             -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
       - name: Build armsx2_libretro
