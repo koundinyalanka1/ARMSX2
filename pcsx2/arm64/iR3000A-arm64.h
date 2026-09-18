@@ -12,6 +12,28 @@
 // Use armPsxRegMem() to construct psxRegs-relative MemOperands cheaply.
 #define RPSXSTATE vixl::aarch64::x21
 
+// The two IOP cycle counters, resident in callee-saved registers for the whole
+// JIT session instead of being loaded and stored at every block tail.
+//
+//   RPSXCYCLE   (x22, u64) mirrors psxRegs.cycle
+//   RPSXEECYCLE (x23, s32) mirrors psxRegs.iopCycleEE
+//
+// Both are ABSOLUTE mirrors, not deltas: the event check still reads
+// psxRegs.iopNextEventCycle from memory, so anything that reschedules an event
+// from inside a C call (an MMIO write reaching PSX_INT, for one) is picked up
+// without the JIT having to know it happened. What the JIT does have to know is
+// that C may also move the counters themselves, so every seam that reaches C
+// flushes both registers first and reloads them after — see armFlushIopCycles /
+// armReloadIopCycles, which are always used as a pair.
+//
+// Both hosts sit outside IOP_ALLOCATABLE_MASK (iCore-arm64.cpp) and inside the
+// x19-x28 range that _DynGen_EnterRecompiledCode's armBeginStackFrame saves, so
+// the EE pins that normally live here (REEPIN_SP / REEPIN_RA) are restored when
+// the IOP session ends.
+#define RPSXCYCLE vixl::aarch64::x22
+#define RPSXEECYCLE vixl::aarch64::w23
+#define RPSXEECYCLE_X vixl::aarch64::x23
+
 // Build a MemOperand addressing a psxRegs field via RPSXSTATE.
 // Mirrors the EE armCpuRegMem pattern. ARM64 LDR with imm12 covers offsets up
 // to 32760 bytes (64-bit) — easily larger than psxRegs, so a single instruction
@@ -72,10 +94,18 @@ extern u16 g_iopCodeCov[kIopCovGranules];
 // iopMemWrite* uses via psxCpu->Clear).
 void iopStoreClearHit(u32 addr);
 
-// Out-of-line RAM-store fast-path stubs (JIT-emitted per reset alongside the
-// dispatchers): index 0/1/2 = 8/16/32-bit. w0 = address, w1 = value; sites
-// call them with a single BL so the fast path adds no per-site icache cost.
+// Out-of-line RAM fast-path stubs (JIT-emitted per reset alongside the
+// dispatchers): index 0/1/2 = 8/16/32-bit. Stores take w0 = address,
+// w1 = value; loads take w0 = address and return the value zero-extended in w0,
+// exactly as iopMemRead* does, leaving sign extension to the site. Sites call
+// them with a single BL so the fast path adds no per-site icache cost.
 extern const void* g_iopStoreStub[3];
+extern const void* g_iopLoadStub[3];
+
+// Publish / re-read the resident cycle counters (RPSXCYCLE / RPSXEECYCLE).
+// Always used as a pair around anything that reaches C.
+void armFlushIopCycles();
+void armReloadIopCycles();
 
 void _psxFlushConstReg(int reg);
 void _psxFlushConstRegs();

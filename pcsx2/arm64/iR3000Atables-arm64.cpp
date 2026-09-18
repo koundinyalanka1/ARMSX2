@@ -49,13 +49,19 @@ extern void gteGPF();   extern void gteGPL();   extern void gteNCCT();
 ////////////////////////////////////////////////////////////////////
 // Interpreter Fallback Macro
 
+// The cycle counters are register-resident for the session (RPSXCYCLE /
+// RPSXEECYCLE), so an interpreter body — which may reach psxException or a
+// hardware path that reschedules — gets them published first and read back
+// after. See the contract in iR3000A-arm64.h.
 #define REC_FUNC(f) \
 	static void rpsx##f() \
 	{ \
 		armAsm->Mov(RWSCRATCH, (u32)psxRegs.code); \
 		armAsm->Str(RWSCRATCH, armPsxRegMem(&psxRegs.code)); \
 		_psxFlushCall(FLUSH_EVERYTHING); \
+		armFlushIopCycles(); \
 		armEmitCall((void*)(uptr)psx##f); \
+		armReloadIopCycles(); \
 		PSX_DEL_CONST(_Rt_); \
 	}
 
@@ -65,7 +71,9 @@ extern void gteGPF();   extern void gteGPL();   extern void gteNCCT();
 		armAsm->Mov(RWSCRATCH, (u32)psxRegs.code); \
 		armAsm->Str(RWSCRATCH, armPsxRegMem(&psxRegs.code)); \
 		_psxFlushCall(FLUSH_EVERYTHING); \
+		armFlushIopCycles(); \
 		armEmitCall((void*)(uptr)gte##f); \
+		armReloadIopCycles(); \
 	}
 
 ////////////////////////////////////////////////////////////////////
@@ -615,125 +623,108 @@ static void rpsxMTLO()
 ////////////////////////////////////////////////////////////////////
 // Load/Store
 //
-// Loads:  compute address in w0, flush, call iopMemReadN, sign/zero extend, store result
-// Stores: compute address in w0, value in w1, flush, call iopMemWriteN
+// Aligned loads and stores marshal their operands into the fast-path stubs'
+// non-allocatable registers (w8 = address, w9 = store value, w8 = load result —
+// see the register contract on _DynGen_LoadStub in iR3000A-arm64.cpp) and emit a
+// single BL. There is deliberately NO _psxFlushCall here: the stub's fast path
+// touches nothing either allocator pool owns, and the paths inside it that reach
+// C save and restore the pool themselves. So guest registers stay resident
+// across memory ops, which in IOP code means they stay resident at all.
+//
+// What that costs us, and why it is safe:
+//   * psxRegs.GPR memory goes stale while a value is register-resident. Nothing
+//     on these paths reads it — iopMemRead*/iopMemWrite* and the hw handlers
+//     they dispatch to work on hardware state, and psxRecClearMem (reachable
+//     from a store's SMC probe) recompiles blocks without consulting guest
+//     registers. Block tails still run _psxFlushCall(FLUSH_EVERYTHING), so
+//     memory is coherent everywhere a branch, event test or exception can see
+//     it.
+//   * Const marks survive too, which is a gain rather than a cost: an MMIO
+//     access cannot write a guest GPR, so anything folded stays foldable.
+//
+// The unaligned merges (LWL/LWR/SWL/SWR, further down) have not been converted
+// and still flush; they marshal into the stub ABI and are otherwise unchanged.
+
+static __fi const void* rpsxLoadStubFor(int size)
+{
+	return g_iopLoadStub[size == 8 ? 0 : (size == 16 ? 1 : 2)];
+}
+
+static __fi const void* rpsxStoreStubFor(int size)
+{
+	return g_iopStoreStub[size == 8 ? 0 : (size == 16 ? 1 : 2)];
+}
+
+// Effective address (rs + imm) into RWSCRATCH, read from wherever rs currently
+// lives — const fold, host register, or memory.
+static void rpsxComputeAddrToScratch()
+{
+	if (PSX_IS_CONST1(_Rs_))
+	{
+		armAsm->Mov(RWSCRATCH, g_psxConstRegs[_Rs_] + _Imm_);
+		return;
+	}
+
+	_psxMoveGPRtoR(RWSCRATCH, _Rs_);
+	if (_Imm_ != 0)
+		armAsm->Add(RWSCRATCH, RWSCRATCH, static_cast<s64>(static_cast<s32>(_Imm_)));
+}
 
 static void rpsxLoadGeneric(int size, bool sign)
 {
-	// Read Rs const value FIRST — before deleting Rt (critical when Rs==Rt,
-	// since _psxDeleteReg clears const state and frees the host register).
-	const bool rs_const = PSX_IS_CONST1(_Rs_);
-	const u32 rs_val = rs_const ? g_psxConstRegs[_Rs_] : 0;
+	// Rs is read BEFORE Rt is written, so Rs == Rt needs no special handling —
+	// the old _psxDeleteReg(_Rt_, 1) guard existed only because the address was
+	// re-read from memory after a flush.
+	rpsxComputeAddrToScratch();
 
-	// Delete destination register (flush=1 to write back, in case Rs==Rt
-	// and Rs is in a host register — need the value in memory).
-	if (_Rt_)
-		_psxDeleteReg(_Rt_, 1);
-
-	_psxFlushCall(FLUSH_EVERYTHING);
-
-	// Compute address: base + imm16 (after flush, safe to use w0)
-	if (rs_const)
-	{
-		armAsm->Mov(RWARG1, rs_val + _Imm_);
-	}
-	else
-	{
-		armLoadPsxRegPtr(RWARG1, &psxRegs.GPR.r[_Rs_]);
-		if (_Imm_ != 0)
-			armAsm->Add(RWARG1, RWARG1, static_cast<s64>(static_cast<s32>(_Imm_)));
-	}
-
-	// Call iopMemRead — address in w0, result returned in w0
-	switch (size)
-	{
-		case 8:  armEmitCall((void*)iopMemRead8);  break;
-		case 16: armEmitCall((void*)iopMemRead16); break;
-		case 32: armEmitCall((void*)iopMemRead32); break;
-	}
+	armEmitCall(rpsxLoadStubFor(size));
 
 	if (!_Rt_)
-		return; // dummy read
+	{
+		// Dummy read: the access still happened, for its side effects.
+		_clearNeededArm64GPRregs();
+		return;
+	}
 
-	// Sign/zero extend result (w0)
+	// Land the result in a host register rather than writing it straight back to
+	// psxRegs. MODE_WRITE on its own emits no fill and drops any const mark for
+	// Rt; the allocator spills someone else if it has to, and every IOP spill is
+	// a bare `str w, [x21, #off]`, so it cannot disturb RWSCRATCH.
+	const int rt = _allocArm64GPR(ARM64TYPE_PSX, _Rt_, MODE_WRITE);
+	const a64::Register rtw = armWRegister(rt);
 	switch (size)
 	{
 		case 8:
 			if (sign)
-				armAsm->Sxtb(RWARG1, RWARG1);
+				armAsm->Sxtb(rtw, RWSCRATCH);
 			else
-				armAsm->Uxtb(RWARG1, RWARG1);
+				armAsm->Uxtb(rtw, RWSCRATCH);
 			break;
 		case 16:
 			if (sign)
-				armAsm->Sxth(RWARG1, RWARG1);
+				armAsm->Sxth(rtw, RWSCRATCH);
 			else
-				armAsm->Uxth(RWARG1, RWARG1);
+				armAsm->Uxth(rtw, RWSCRATCH);
 			break;
 		case 32:
-			break; // no extension needed
+			armAsm->Mov(rtw, RWSCRATCH);
+			break;
 	}
 
-	// Store result to destination register
-	armStorePsxRegPtr(RWARG1, &psxRegs.GPR.r[_Rt_]);
-}
-
-// Emit the C fallback for a store — address in w0, value in w1.
-static void rpsxEmitStoreCall(int size)
-{
-	switch (size)
-	{
-		case 8:  armEmitCall((void*)iopMemWrite8);  break;
-		case 16: armEmitCall((void*)iopMemWrite16); break;
-		case 32: armEmitCall((void*)iopMemWrite32); break;
-	}
+	_clearNeededArm64GPRregs();
 }
 
 static void rpsxStoreGeneric(int size)
 {
-	// Read const values before flush
-	const bool rs_const = PSX_IS_CONST1(_Rs_);
-	const u32 rs_val = rs_const ? g_psxConstRegs[_Rs_] : 0;
-	const bool rt_const = PSX_IS_CONST1(_Rt_);
-	const u32 rt_val = rt_const ? g_psxConstRegs[_Rt_] : 0;
+	rpsxComputeAddrToScratch();
 
-	// Flush all registers BEFORE computing operands
-	_psxFlushCall(FLUSH_EVERYTHING);
+	// Value into w9. _psxMoveGPRtoR covers const, resident and memory-only Rt,
+	// and materialises a literal 0 for r0.
+	_psxMoveGPRtoR(a64::w9, _Rt_);
 
-	// Compute address: base + imm16
-	if (rs_const)
-	{
-		armAsm->Mov(RWARG1, rs_val + _Imm_);
-	}
-	else
-	{
-		armLoadPsxRegPtr(RWARG1, &psxRegs.GPR.r[_Rs_]);
-		if (_Imm_ != 0)
-			armAsm->Add(RWARG1, RWARG1, static_cast<s64>(static_cast<s32>(_Imm_)));
-	}
+	armEmitCall(rpsxStoreStubFor(size));
 
-	// Load store value into w1
-	if (rt_const)
-		armAsm->Mov(RWARG2, rt_val);
-	else
-		armLoadPsxRegPtr(RWARG2, &psxRegs.GPR.r[_Rt_]);
-
-	// RAM-store fast path, out-of-line: one BL into the shared per-width stub
-	// (g_iopStoreStub, emitted with the dispatchers — see _DynGen_StoreStub
-	// in iR3000A-arm64.cpp for the routing derivation). The site stays the
-	// same size as the old C call, so the fast path costs no per-site icache
-	// footprint; the stub tail-jumps to iopMemWrite* for hw/unmapped targets,
-	// which then returns here directly.
-	//
-	// Compile-time-known hw/unmapped targets skip the stub and call C
-	// straight away — identical to the old code.
-	if (rs_const && ((rs_val + _Imm_) & 0x1f800000) != 0)
-	{
-		rpsxEmitStoreCall(size);
-		return;
-	}
-
-	armEmitCall(g_iopStoreStub[size == 8 ? 0 : (size == 16 ? 1 : 2)]);
+	_clearNeededArm64GPRregs();
 }
 
 static void rpsxLB()  { rpsxLoadGeneric(8, true); }
@@ -798,7 +789,9 @@ static void rpsxLWL()
 	armAsm->Sub(a64::sp, a64::sp, 16);
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem (aligned word)
+	armAsm->Mov(RWSCRATCH, RWARG1);                // w8 = aligned addr (stub ABI)
+	armEmitCall(g_iopLoadStub[2]);                 // w8 = mem
+	armAsm->Mov(RWARG1, RWSCRATCH);                // w0 = mem, as the merge expects (aligned word)
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp));
 	armAsm->Add(a64::sp, a64::sp, 16);
@@ -835,7 +828,9 @@ static void rpsxLWR()
 	armAsm->Sub(a64::sp, a64::sp, 16);
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	armAsm->Mov(RWSCRATCH, RWARG1);                // w8 = aligned addr (stub ABI)
+	armEmitCall(g_iopLoadStub[2]);                 // w8 = mem
+	armAsm->Mov(RWARG1, RWSCRATCH);                // w0 = mem, as the merge expects
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp));
 	armAsm->Add(a64::sp, a64::sp, 16);
@@ -874,7 +869,9 @@ static void rpsxSWL()
 	armAsm->Str(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp, 4));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	armAsm->Mov(RWSCRATCH, RWARG1);                // w8 = aligned addr (stub ABI)
+	armEmitCall(g_iopLoadStub[2]);                 // w8 = mem
+	armAsm->Mov(RWARG1, RWSCRATCH);                // w0 = mem, as the merge expects
 
 	// Reload shift_input and aligned addr; mem stays in w0.
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp, 4));  // w1 = shift_input
@@ -897,12 +894,13 @@ static void rpsxSWL()
 	armAsm->And(a64::w0, a64::w0, a64::w2);        // w0 = mem & mask
 	armAsm->Orr(a64::w0, a64::w0, a64::w3);        // merged value
 
-	// Now write back. iopMemWrite32(addr, value): w0 = addr, w1 = value.
-	armAsm->Mov(RWARG2, a64::w0);                  // w1 = value
-	armAsm->Ldr(RWARG1, a64::MemOperand(a64::sp, 0)); // w0 = aligned addr
+	// Now write back, through the same stub SW uses so the IsC swallow and the
+	// SMC coverage probe behave identically. w8 = addr, w9 = value.
+	armAsm->Mov(a64::w9, a64::w0);                 // w9 = value
+	armAsm->Ldr(RWSCRATCH, a64::MemOperand(a64::sp, 0)); // w8 = aligned addr
 	armAsm->Add(a64::sp, a64::sp, 16);
 
-	armEmitCall((void*)iopMemWrite32);
+	armEmitCall(g_iopStoreStub[2]);
 }
 
 static void rpsxSWR()
@@ -918,7 +916,9 @@ static void rpsxSWR()
 	armAsm->Str(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp, 4));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	armAsm->Mov(RWSCRATCH, RWARG1);                // w8 = aligned addr (stub ABI)
+	armEmitCall(g_iopLoadStub[2]);                 // w8 = mem
+	armAsm->Mov(RWARG1, RWSCRATCH);                // w0 = mem, as the merge expects
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp, 4));
 	armAsm->Lsl(a64::w1, a64::w1, 3);              // w1 = shift
@@ -938,11 +938,11 @@ static void rpsxSWR()
 	armAsm->And(a64::w0, a64::w0, a64::w2);        // w0 = mem & mask
 	armAsm->Orr(a64::w0, a64::w0, a64::w3);        // merged value
 
-	armAsm->Mov(RWARG2, a64::w0);
-	armAsm->Ldr(RWARG1, a64::MemOperand(a64::sp, 0));
+	armAsm->Mov(a64::w9, a64::w0);                 // w9 = value (stub ABI)
+	armAsm->Ldr(RWSCRATCH, a64::MemOperand(a64::sp, 0)); // w8 = aligned addr
 	armAsm->Add(a64::sp, a64::sp, 16);
 
-	armEmitCall((void*)iopMemWrite32);
+	armEmitCall(g_iopStoreStub[2]);
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -1192,7 +1192,9 @@ static void rpsxRFE()
 	armAsm->Bfi(RWSCRATCH, RWARG1, 0, 4);          // replace low 4 bits of Status
 	armStorePsxRegPtr(RWSCRATCH, &psxRegs.CP0.n.Status);
 
+	armFlushIopCycles();
 	armEmitCall((void*)iopTestIntc);
+	armReloadIopCycles();
 }
 
 ////////////////////////////////////////////////////////////////////
