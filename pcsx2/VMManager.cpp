@@ -274,11 +274,28 @@ bool VMManager::PerformEarlyHardwareChecks(const char** error)
 	}
 #endif
 #elif defined(ARCH_ARM64)
-	// Check page size. If it doesn't match, it is a fatal error.
+	// The page size this build was compiled for has to be one the kernel can express. It
+	// need not be the kernel's own: a build compiled for a larger page runs fine on a
+	// smaller one, since every mapping it makes is a whole multiple of that larger page.
+	// Only the other direction is fatal - see HostSys::IsRuntimePageSizeCompatible.
 	const size_t runtime_host_page_size = HostSys::GetRuntimePageSize();
-	if (__pagesize != runtime_host_page_size)
+	if (!HostSys::IsRuntimePageSizeCompatible(runtime_host_page_size))
 	{
-		*error = "Page size mismatch. This build cannot run on your system.\n\n" COMMON_DOWNLOAD_MESSAGE;
+		static char page_size_error[256];
+		if (runtime_host_page_size == 0)
+		{
+			std::snprintf(page_size_error, sizeof(page_size_error),
+				"Could not read this system's page size, so this build cannot tell whether it is able "
+				"to run here.\n\n" COMMON_DOWNLOAD_MESSAGE);
+		}
+		else
+		{
+			std::snprintf(page_size_error, sizeof(page_size_error),
+				"Page size mismatch. This build is compiled for %uK pages, which your system's %zuK "
+				"pages cannot express, so it cannot run here.\n\n" COMMON_DOWNLOAD_MESSAGE,
+				__pagesize / 1024u, runtime_host_page_size / 1024);
+		}
+		*error = page_size_error;
 		return false;
 	}
 #endif

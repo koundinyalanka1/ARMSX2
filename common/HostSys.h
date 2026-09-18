@@ -123,6 +123,29 @@ namespace HostSys
 	/// Returns the size of pages for the current host.
 	size_t GetRuntimePageSize();
 
+	/// True when a build compiled for __pagesize can run on a kernel whose page size is
+	/// `runtime_page_size`.
+	///
+	/// Equality is not the requirement - only that the kernel's page size divides the one
+	/// the build was compiled for. Every mapping the emulator makes is a whole number of
+	/// __pagesize units and aligned to one, so on a smaller kernel page those mmap and
+	/// mprotect calls stay legal and correctly aligned: a 16K build simply treats four 4K
+	/// kernel pages as the one page it thinks in. vtlb already works this way whenever
+	/// __pagesize exceeds its own 4K page - the path Apple Silicon has always taken - so
+	/// the coarser protection granularity costs some fastmem churn and nothing else.
+	///
+	/// The reverse genuinely cannot work: a 4K build protects sub-ranges of a 16K kernel
+	/// page, which the kernel has no way to express.
+	///
+	/// So one arm64 binary compiled for the largest page size it may meet runs everywhere,
+	/// which is what keeps 16K-page devices (Android 15 and up) from needing a build of
+	/// their own.
+	constexpr bool IsRuntimePageSizeCompatible(size_t runtime_page_size)
+	{
+		// A failed query reads as incompatible: better to refuse than to map blind.
+		return runtime_page_size != 0 && (__pagesize % runtime_page_size) == 0;
+	}
+
 	/// Returns the size of a cache line for the current host.
 	size_t GetRuntimeCacheLineSize();
 } // namespace HostSys
