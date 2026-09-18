@@ -126,7 +126,8 @@ protected:
 	// Store only, no cache maintenance. Fine for a site inside the block
 	// currently being emitted (that buffer has not been executed yet, and
 	// armEndBlock() issues one whole-range flush over it), and for the
-	// New() repoint loop, whose callers flush via FlushPatchedSites.
+	// New() and Remove() patch loops, which flush via FlushPatchedSites
+	// before returning.
 	// Never use this on code that is already live without a flush; use
 	// PatchAtomic.
 	static void PatchWord(uptr site, u32 instr)
@@ -374,25 +375,52 @@ public:
 	// correct.
 	//
 	// SL-1: a resident self-loop's back-edge is an internal B to the loop-top
-	// (past the entry redirect), so it gets its own atomic repoint — to the
-	// block's cold spill stub, which writes back the pinned set, publishes pc,
-	// and exits via DispatcherEvent. Flat-array field reads + PatchAtomic
-	// only, so the signal-safety contract holds.
+	// (past the entry redirect), so it gets its own repoint — to the block's
+	// cold spill stub, which writes back the pinned set, publishes pc, and
+	// exits via DispatcherEvent. Flat-array field reads, PatchWord and a
+	// stack buffer only, so the signal-safety contract holds: nothing here
+	// allocates or touches an STL container until the patching is done.
+	//
+	// The flushes are batched, the same shape New() uses for its link
+	// repointing. recClear removes a whole range at a time - every block a
+	// self-modifying write invalidated - and a 4-byte flush costs a dsb ish /
+	// isb pair, so flushing per site paid a barrier pair per block (two, for a
+	// block with a back-edge) where one coalesced range pays it once. The
+	// stores all land before any of them is published, which is the same
+	// ordering PatchAtomic gave: everything is flushed before Remove returns,
+	// and nothing between here and there executes guest code.
 	__fi void Remove(int first, int last)
 	{
 		pxAssert(first <= last);
 
 		if (jitcompile)
 		{
+			uptr patched[64];
+			u32 npatched = 0;
+			const auto record = [&patched, &npatched](uptr site) {
+				if (npatched < std::size(patched))
+					patched[npatched++] = site;
+				else
+					FlushRange(site, site + 4); // overflow: flush as we go
+			};
+
 			for (int i = first; i <= last; ++i)
 			{
 				const uptr site = blocks[i].fnptr;
-				PatchAtomic(site, EncodeB(site, StaleDispatchTarget()));
+				PatchWord(site, EncodeB(site, StaleDispatchTarget()));
+				record(site);
 
 				if (blocks[i].backedge_site)
-					PatchAtomic(blocks[i].backedge_site,
+				{
+					PatchWord(blocks[i].backedge_site,
 						EncodeB(blocks[i].backedge_site, blocks[i].backedge_stub));
+					record(blocks[i].backedge_site);
+				}
 			}
+
+			// std::sort inside, over the stack array above - computation only,
+			// no allocation, so it keeps the handler contract.
+			FlushPatchedSites(patched, npatched);
 		}
 
 		blocks.erase(first, last + 1);
