@@ -31,6 +31,32 @@ constexpr u32 kParkingPc = RecompilerTestEnvironment::kParkingPc;    // 0x001F00
 constexpr u32 kBlock2Pc = 0x00014000;
 } // namespace
 
+TEST(IopSmc, PartialStoresInvalidateCompiledBlockThroughAnotherMirror)
+{
+	for (const bool left : {false, true})
+	{
+		JitTestHarness h;
+		constexpr u32 mirror = 0xa0000000u | kBlock2Pc;
+		h.SetGpr(reg::a0, mirror);
+		h.SetGpr(reg::a1, ADDIU(reg::v0, reg::zero, 0x1337));
+		h.LoadProgramAt(kProgramPc, {
+			ADDIU(reg::t0, reg::a1, 1), // must survive the SMC helper
+			left ? SWL(reg::a1, 3, reg::a0) : SWR(reg::a1, 0, reg::a0),
+			J(kBlock2Pc), NOP,
+		});
+		h.LoadProgramAt(kBlock2Pc, {ADDIU(reg::v0, reg::zero, 0x0bad)}, true);
+		h.SetPc(kBlock2Pc);
+		h.Run();
+		ASSERT_EQ(h.GetGprJit(reg::v0), 0x0badu);
+
+		h.SetPc(kProgramPc);
+		h.SetRa(kParkingPc);
+		h.RunResume();
+		EXPECT_EQ(h.GetGprJit(reg::v0), 0x1337u);
+		EXPECT_EQ(h.GetGprJit(reg::t0), ADDIU(reg::v0, reg::zero, 0x1337) + 1);
+	}
+}
+
 TEST(IopSmc, HarnessOverwriteThenRunProducesNewResult)
 {
 	// 1) Compile a 100-producing program. 2) Rewrite the first word in

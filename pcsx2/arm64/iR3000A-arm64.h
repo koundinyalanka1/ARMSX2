@@ -95,8 +95,8 @@ extern u16 g_iopCodeCov[kIopCovGranules];
 void iopStoreClearHit(u32 addr);
 
 // Out-of-line RAM fast-path stubs (JIT-emitted per reset alongside the
-// dispatchers): index 0/1/2 = 8/16/32-bit. Stores take w0 = address,
-// w1 = value; loads take w0 = address and return the value zero-extended in w0,
+// dispatchers): index 0/1/2 = 8/16/32-bit. Stores take w8 = address,
+// w9 = value; loads take w8 = address and return the value zero-extended in w8,
 // exactly as iopMemRead* does, leaving sign extension to the site. Sites call
 // them with a single BL so the fast path adds no per-site icache cost.
 extern const void* g_iopStoreStub[3];

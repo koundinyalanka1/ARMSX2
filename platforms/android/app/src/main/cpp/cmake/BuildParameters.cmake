@@ -138,8 +138,14 @@ elseif("${_PCSX2_TARGET_PROCESSOR}" STREQUAL "arm64" OR "${_PCSX2_TARGET_PROCESS
 		add_compile_options("-march=armv8.4-a" "-mcpu=apple-m1")
 	elseif(ANDROID)
 		message(STATUS "Building for Android (ARM64).")
-		# ARMv8.0-a is the baseline for Android arm64-v8a
-		add_compile_options("-march=armv8-a")
+		# Keep the baseline on older phones, but honor each language's explicit
+		# target (including configuration flags) supplied by the APK build.
+		string(TOUPPER "${CMAKE_BUILD_TYPE}" android_build_type)
+		foreach(language C CXX)
+			if(NOT "${CMAKE_${language}_FLAGS} ${CMAKE_${language}_FLAGS_${android_build_type}}" MATCHES "-march=")
+				add_compile_options("$<$<COMPILE_LANGUAGE:${language}>:-march=armv8-a>")
+			endif()
+		endforeach()
 	else()
 		message(STATUS "Building for ARM64.")
 		# Require atomic rmw instructions

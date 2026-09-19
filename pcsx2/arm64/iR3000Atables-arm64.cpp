@@ -642,8 +642,8 @@ static void rpsxMTLO()
 //   * Const marks survive too, which is a gain rather than a cost: an MMIO
 //     access cannot write a guest GPR, so anything folded stays foldable.
 //
-// The unaligned merges (LWL/LWR/SWL/SWR, further down) have not been converted
-// and still flush; they marshal into the stub ABI and are otherwise unchanged.
+// Standalone builds also keep registers resident through the unaligned merges
+// below. The legacy emitter remains available for other frontends.
 
 static __fi const void* rpsxLoadStubFor(int size)
 {
@@ -675,9 +675,27 @@ static void rpsxLoadGeneric(int size, bool sign)
 	// Rs is read BEFORE Rt is written, so Rs == Rt needs no special handling —
 	// the old _psxDeleteReg(_Rt_, 1) guard existed only because the address was
 	// re-read from memory after a flush.
-	rpsxComputeAddrToScratch();
-
-	armEmitCall(rpsxLoadStubFor(size));
+#ifdef ARMSX2_STANDALONE_IOP_OPTIMIZATIONS
+	const u32 address = g_psxConstRegs[_Rs_] + _Imm_;
+	if (PSX_IS_CONST1(_Rs_) && (address & 0x1f800000u) == 0)
+	{
+		// Same RAM window/mirror mask as the stub. The RAM allocation and
+		// exposed-size mask are stable until recResetIOP discards this code.
+		// Hardware and ROM reads must still take the side-effecting stub.
+		armMoveAddressToReg(a64::x10, &iopMem->Main[address & (Ps2MemSize::ExposedIopRam - 1)]);
+		switch (size)
+		{
+			case 8: armAsm->Ldrb(RWSCRATCH, a64::MemOperand(a64::x10)); break;
+			case 16: armAsm->Ldrh(RWSCRATCH, a64::MemOperand(a64::x10)); break;
+			case 32: armAsm->Ldr(RWSCRATCH, a64::MemOperand(a64::x10)); break;
+		}
+	}
+	else
+#endif
+	{
+		rpsxComputeAddrToScratch();
+		armEmitCall(rpsxLoadStubFor(size));
+	}
 
 	if (!_Rt_)
 	{
@@ -745,10 +763,124 @@ static void rpsxSW()  { rpsxStoreGeneric(32); }
 //  op merges memory bytes with the existing register/memory contents per
 //  the formulae in pcsx2/R3000AOpcodeTables.cpp:psxLWL/LWR/SWL/SWR.
 //
-//  byte_addr = rs + imm; (addr & 3) is saved to the stack across the
-//  iopMemRead32/Write32 C call; then the mask + shift + or merge is done
-//  inline, replacing the REC_FUNC interp fallback.
+//  Both emitters preserve byte_addr = rs + imm across the read stub before
+//  merging. Standalone builds use a preserved temporary or fold a constant
+//  address; the legacy emitter uses the stack and flushes guest registers.
 // =====================================================================================================
+
+#ifdef ARMSX2_STANDALONE_IOP_OPTIMIZATIONS
+// Keep the byte address in an allocated temporary: both RAM and C-helper
+// paths of the stubs preserve it. Only their reserved w8/w9/w10/w17 scratch
+// registers are used for the merge, so unrelated guest values remain live.
+static void rpsxUnalignedResident(bool store, bool left)
+{
+	const bool constant = PSX_IS_CONST1(_Rs_);
+	const u32 byte_address = constant ? g_psxConstRegs[_Rs_] + _Imm_ : 0;
+	int address_reg = -1;
+	if (constant)
+		armAsm->Mov(RWSCRATCH, byte_address & ~3u);
+	else
+	{
+		rpsxComputeAddrToScratch();
+		address_reg = _allocArm64GPR(ARM64TYPE_TEMP, 0, MODE_WRITE);
+		armAsm->Mov(armWRegister(address_reg), RWSCRATCH);
+		armAsm->Bic(RWSCRATCH, armWRegister(address_reg), 3);
+	}
+	armEmitCall(g_iopLoadStub[2]);
+
+	if (!store && !_Rt_)
+	{
+		// Even a discarded load must perform its hardware read.
+		if (address_reg >= 0)
+			_freeArm64GPR(address_reg);
+		_clearNeededArm64GPRregs();
+		return;
+	}
+
+	// Read Rt before allocating its write destination, including Rs == Rt
+	// and constant Rt. This also preserves the old value for partial loads.
+	_psxMoveGPRtoR(a64::w9, _Rt_);
+	if (constant)
+	{
+		const u32 shift = (byte_address & 3) * 8;
+		const u32 mask = store ? (left ? 0xffffff00u << shift : 0x00ffffffu >> (24 - shift)) :
+			(left ? 0x00ffffffu >> shift : 0xffffff00u << (24 - shift));
+		const a64::Register preserved = store ? a64::w8 : a64::w9;
+		if (mask)
+			armAsm->And(preserved, preserved, mask);
+		else
+			armAsm->Mov(preserved, 0);
+		if (store)
+		{
+			if (left)
+				armAsm->Lsr(a64::w9, a64::w9, 24 - shift);
+			else
+				armAsm->Lsl(a64::w9, a64::w9, shift);
+		}
+		else
+		{
+			if (left)
+				armAsm->Lsl(a64::w8, a64::w8, 24 - shift);
+			else
+				armAsm->Lsr(a64::w8, a64::w8, shift);
+		}
+	}
+	else
+	{
+		armAsm->And(a64::w10, armWRegister(address_reg), 3);
+		armAsm->Lsl(a64::w10, a64::w10, 3);
+		if (left)
+		{
+			armAsm->Mov(a64::w17, store ? 0xffffff00u : 0x00ffffffu);
+			if (store)
+				armAsm->Lsl(a64::w17, a64::w17, a64::w10);
+			else
+				armAsm->Lsr(a64::w17, a64::w17, a64::w10);
+			armAsm->And(store ? a64::w8 : a64::w9, store ? a64::w8 : a64::w9, a64::w17);
+			armAsm->Mov(a64::w17, 24);
+			armAsm->Sub(a64::w10, a64::w17, a64::w10);
+			if (store)
+				armAsm->Lsr(a64::w9, a64::w9, a64::w10);
+			else
+				armAsm->Lsl(a64::w8, a64::w8, a64::w10);
+		}
+		else
+		{
+			if (store)
+				armAsm->Lsl(a64::w9, a64::w9, a64::w10);
+			else
+				armAsm->Lsr(a64::w8, a64::w8, a64::w10);
+			armAsm->Mov(a64::w17, 24);
+			armAsm->Sub(a64::w10, a64::w17, a64::w10);
+			armAsm->Mov(a64::w17, store ? 0x00ffffffu : 0xffffff00u);
+			if (store)
+				armAsm->Lsr(a64::w17, a64::w17, a64::w10);
+			else
+				armAsm->Lsl(a64::w17, a64::w17, a64::w10);
+			armAsm->And(store ? a64::w8 : a64::w9, store ? a64::w8 : a64::w9, a64::w17);
+		}
+	}
+	armAsm->Orr(a64::w9, a64::w9, a64::w8);
+	if (store)
+	{
+		if (constant)
+			armAsm->Mov(RWSCRATCH, byte_address & ~3u);
+		else
+			armAsm->Bic(RWSCRATCH, armWRegister(address_reg), 3);
+		// Keep IsC swallowing, coverage probing and helper-cycle publication
+		// in the existing store stub. No writes are delayed or combined.
+		armEmitCall(g_iopStoreStub[2]);
+	}
+	else
+	{
+		const int rt = _allocArm64GPR(ARM64TYPE_PSX, _Rt_, MODE_WRITE);
+		armAsm->Mov(armWRegister(rt), a64::w9);
+	}
+	if (address_reg >= 0)
+		_freeArm64GPR(address_reg);
+	_clearNeededArm64GPRregs();
+}
+#endif
 
 // Compute byte address (rs + imm) into RWARG1, leaving (byte_addr & 3) in
 // RWSCRATCH for the caller's later use *before* the C call clobbers w0.
@@ -777,6 +909,10 @@ static void rpsxComputeUnalignedAddr()
 
 static void rpsxLWL()
 {
+#ifdef ARMSX2_STANDALONE_IOP_OPTIMIZATIONS
+	rpsxUnalignedResident(false, true);
+	return;
+#endif
 	if (_Rt_)
 		_psxDeleteReg(_Rt_, 1);
 
@@ -818,6 +954,10 @@ static void rpsxLWL()
 
 static void rpsxLWR()
 {
+#ifdef ARMSX2_STANDALONE_IOP_OPTIMIZATIONS
+	rpsxUnalignedResident(false, false);
+	return;
+#endif
 	if (_Rt_)
 		_psxDeleteReg(_Rt_, 1);
 
@@ -856,6 +996,10 @@ static void rpsxLWR()
 
 static void rpsxSWL()
 {
+#ifdef ARMSX2_STANDALONE_IOP_OPTIMIZATIONS
+	rpsxUnalignedResident(true, true);
+	return;
+#endif
 	const bool rt_const = PSX_IS_CONST1(_Rt_);
 	const u32 rt_val = rt_const ? g_psxConstRegs[_Rt_] : 0;
 
@@ -905,6 +1049,10 @@ static void rpsxSWL()
 
 static void rpsxSWR()
 {
+#ifdef ARMSX2_STANDALONE_IOP_OPTIMIZATIONS
+	rpsxUnalignedResident(true, false);
+	return;
+#endif
 	const bool rt_const = PSX_IS_CONST1(_Rt_);
 	const u32 rt_val = rt_const ? g_psxConstRegs[_Rt_] : 0;
 

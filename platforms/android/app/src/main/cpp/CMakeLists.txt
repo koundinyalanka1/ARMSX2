@@ -30,6 +30,11 @@ set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # Android is a non-desktop frontend: no Qt UI.
 set(ENABLE_QT_UI OFF CACHE BOOL "" FORCE)
 
+# The shared core also builds for libretro. Enable these emitter changes only
+# for the standalone app; desktop test builds may explicitly opt in.
+option(ARMSX2_STANDALONE_IOP_OPTIMIZATIONS "Optimize standalone IOP memory code generation" ON)
+option(ARMSX2_STANDALONE_FASTMEM_OPTIMIZATIONS "Use runtime fastmem mapping units in standalone builds" ON)
+
 # This build has libadrenotools (added below), so the custom Vulkan driver
 # splice in VKLoader.cpp is compiled in. Other Android builds - the libretro
 # core the buildbot makes - do not.

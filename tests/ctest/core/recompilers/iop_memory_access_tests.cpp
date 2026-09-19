@@ -10,13 +10,13 @@
 //     path's 21-bit mask).
 //   * Helper-path dispatch — any effective address with bit 28 set bypasses
 //     the fast path and calls iopMemRead*/iopMemWrite* directly.
-//   * Unaligned load/store (LWL/LWR/SWL/SWR) via the REC_FUNC interpreter
-//     fallback — a different JIT code path from aligned loads/stores.
+//   * Unaligned load/store (LWL/LWR/SWL/SWR) partial-word merges.
 //   * `lw $0, ...` short-circuit (the _Rt_==0 branch in rpsxLW).
 
 #include "harness/JitTestHarness.h"
 
 #include "MemoryTypes.h"
+#include "IopHw.h"
 
 #include <gtest/gtest.h>
 
@@ -49,6 +49,148 @@ constexpr u32 kHwInertAddr = 0x1F802000u;
 // coincidental zero.
 constexpr u32 kRamSentinel = 0xA5A5C3C3u;
 } // namespace
+
+TEST(IopMemoryAccess, PartialWordMergesPreserveResidentValues)
+{
+	using Encode = u32 (*)(u32, s16, u32);
+	const Encode ops[] = {LWL, LWR, SWL, SWR};
+	for (const Encode op : ops)
+	for (const u32 base : {kPhysBase, kKseg0Base, kKseg1Base, kHwInertAddr})
+	for (s16 offset = 0; offset < 4; offset++)
+	for (const u32 target : {reg::v0, reg::a0, reg::zero})
+	{
+		SCOPED_TRACE(::testing::Message() << "instruction=" << op(target, offset, reg::a0)
+			<< " base=" << base);
+		JitTestHarness h;
+		h.WriteU32(base, 0x89abcdefu);
+		h.SetGpr(reg::a0, base);
+		h.SetGpr(reg::v0, 0x76543210u);
+		h.SetGpr(reg::t0, 31);
+		h.LoadProgram({
+			ADDIU(reg::t1, reg::t0, 7), // dirty register live across both helper calls
+			ADDIU(reg::v0, reg::v0, 1),
+			op(target, offset, reg::a0),
+			ADDU(reg::v1, reg::t1, reg::v0),
+		});
+		h.Run();
+	}
+}
+
+TEST(IopMemoryAccess, PartialWordMergesWithConstantOperands)
+{
+	using Encode = u32 (*)(u32, s16, u32);
+	for (const Encode op : {LWL, LWR, SWL, SWR})
+	for (s16 offset = 0; offset < 4; offset++)
+	{
+		SCOPED_TRACE(op(reg::v0, offset, reg::a0));
+		JitTestHarness h;
+		h.WriteU32(kPhysBase, 0x89abcdefu);
+		h.LoadProgram({
+			LUI(reg::a0, kKseg1Base >> 16),
+			LUI(reg::v0, 0x7654), ORI(reg::v0, reg::v0, 0x3210),
+			op(reg::v0, offset, reg::a0),
+			ADDIU(reg::v1, reg::v0, 1),
+		});
+		h.Run();
+	}
+}
+
+TEST(IopMemoryAccess, PartialStoresRespectCacheIsolation)
+{
+	using Encode = u32 (*)(u32, s16, u32);
+	for (const Encode op : {SWL, SWR})
+	for (s16 offset = 0; offset < 4; offset++)
+	{
+		JitTestHarness h;
+		h.WriteU32(kPhysBase, 0x89abcdefu);
+		h.SetGpr(reg::a0, kKseg1Base);
+		h.SetGpr(reg::v0, 0x12345678u);
+		h.LoadProgram({op(reg::v0, offset, reg::a0)});
+		h.SetCp0(12, 1u << 16); // install after writing the test program
+		h.Run();
+		EXPECT_EQ(h.ReadU32(kPhysBase), 0x89abcdefu);
+	}
+}
+
+TEST(IopMemoryAccess, ConstantRamLoadsMatchDynamicLoads)
+{
+	using Encode = u32 (*)(u32, s16, u32);
+	for (const Encode op : {LB, LBU, LH, LHU, LW})
+	for (const u32 base : {kPhysBase, kKseg0Base, kKseg1Base})
+	{
+		SCOPED_TRACE(::testing::Message() << "instruction=" << op(reg::a0, -4, reg::a0)
+			<< " base=" << base);
+		JitTestHarness h;
+		h.WriteU32(kPhysBase, 0xfedcba98u);
+		h.SetGpr(reg::a1, base + 4);
+		h.LoadProgram({
+			LUI(reg::a0, base >> 16), ORI(reg::a0, reg::a0, 4),
+			op(reg::zero, -4, reg::a0),
+			op(reg::a0, -4, reg::a0), // constant base aliases destination
+			op(reg::v0, -4, reg::a1),
+		});
+		h.Run();
+		EXPECT_EQ(h.GetGprJit(reg::a0), h.GetGprJit(reg::v0));
+	}
+}
+
+TEST(IopMemoryAccess, PartialMergesUnderRegisterPressure)
+{
+	JitTestHarness h;
+	h.SetGpr(reg::a0, kPhysBase);
+	std::vector<u32> program;
+	// Twenty dirty, nonconstant guest values force allocator eviction. Keep
+	// them live through partial loads and stores, then consume all of them.
+	for (u32 r = 8; r < 28; r++)
+	{
+		h.WriteU32(kPhysBase + r * 4, 0x01010101u * r);
+		program.push_back(LW(r, static_cast<s16>(r * 4), reg::a0));
+	}
+	program.push_back(LWL(reg::t0, 37, reg::a0));
+	program.push_back(LWR(reg::t1, 42, reg::a0));
+	program.push_back(SWL(reg::t2, 47, reg::a0));
+	program.push_back(SWR(reg::t3, 48, reg::a0));
+	program.push_back(ADDU(reg::v0, reg::zero, reg::zero));
+	for (u32 r = 8; r < 28; r++)
+		program.push_back(ADDU(reg::v0, reg::v0, r));
+	h.LoadProgramAt(RecompilerTestEnvironment::kProgramPc, program.data(), program.size(), true);
+	h.Run();
+}
+
+TEST(IopMemoryAccess, ConstantDiscardedLoadsStillPerformHardwareRead)
+{
+	using Encode = u32 (*)(u32, s16, u32);
+	for (const Encode op : {LW, LWL, LWR})
+	{
+		// I_CTRL clears on read. Run the same initial hardware state through
+		// each backend independently, because the harness snapshots RAM only.
+		for (const auto mode : {JitTestHarness::Mode::JitOnly, JitTestHarness::Mode::InterpOnly})
+		{
+			JitTestHarness h(mode);
+			const u32 saved = psxHu32(HW_ICTRL);
+			psxHu32(HW_ICTRL) = 0x12345678;
+			h.LoadProgram({LUI(reg::a0, 0x1f80), ORI(reg::a0, reg::a0, 0x1078), op(reg::zero, 0, reg::a0)});
+			h.Run();
+			EXPECT_EQ(psxHu32(HW_ICTRL), 0u);
+			psxHu32(HW_ICTRL) = saved;
+		}
+	}
+}
+
+TEST(IopMemoryAccess, PartialWordAccessInBranchDelaySlot)
+{
+	using Encode = u32 (*)(u32, s16, u32);
+	for (const Encode op : {LWL, LWR, SWL, SWR})
+	for (s16 offset = 0; offset < 4; offset++)
+	{
+		JitTestHarness h;
+		h.WriteU32(kPhysBase, 0x89abcdefu);
+		h.SetGpr(reg::a0, kKseg1Base);
+		h.SetGpr(reg::v0, 0x12345678);
+		h.LoadProgramNoTerm({ADDIU(reg::v0, reg::v0, 1), JR(reg::ra), op(reg::v0, offset, reg::a0)});
+		h.Run();
+	}
+}
 
 // ---------------------------------------------------------------------------
 // RAM mirror aliasing — physical / kseg0 / kseg1 all address the same byte.

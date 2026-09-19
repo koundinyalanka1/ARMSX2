@@ -16,8 +16,24 @@
 
 #include "common/HostSys.h"
 #include "vtlbProtection.h"
+#include "vtlbFastmem.h"
 
 #include <gtest/gtest.h>
+
+TEST(HostPageSize, RuntimeFastmemMapsIndependent4KPagesIn16KBuild)
+{
+	// A partial or noncontiguous group cannot be mapped as a single 16K
+	// kernel page. On a 4K kernel each guest page is independently eligible.
+	const u32 offsets[] = {0xffffffffu, 0x5000, 0xb000, 0xffffffffu};
+	EXPECT_TRUE(vtlbFastmem::IsCoalesced(offsets, 1, 0x1000, 0x1000));
+	EXPECT_TRUE(vtlbFastmem::IsCoalesced(offsets, 2, 0x1000, 0x1000));
+	EXPECT_FALSE(vtlbFastmem::IsCoalesced(offsets, 0, 0x1000, 0x1000));
+	EXPECT_FALSE(vtlbFastmem::IsCoalesced(offsets, 1, 0x4000, 0x1000));
+	const u32 contiguous[] = {0x8000, 0x9000, 0xa000, 0xb000};
+	EXPECT_TRUE(vtlbFastmem::IsCoalesced(contiguous, 2, 0x4000, 0x1000));
+	const u32 unaligned[] = {0x9000, 0xa000, 0xb000, 0xc000};
+	EXPECT_FALSE(vtlbFastmem::IsCoalesced(unaligned, 2, 0x4000, 0x1000));
+}
 
 TEST(HostPageSize, AcceptsTheKernelPageThisBuildWasCompiledFor)
 {

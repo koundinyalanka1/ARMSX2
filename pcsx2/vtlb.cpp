@@ -18,6 +18,7 @@
 
 #include "Common.h"
 #include "vtlb.h"
+#include "vtlbFastmem.h"
 #include "vtlbPageRuns.h"
 #include "vtlbProtection.h"
 #include "COP0.h"
@@ -95,6 +96,17 @@ static std::vector<u32> s_fastmem_faulting_pcs; // sorted; lookups via binary se
 // Initialized before mappings or fault handlers are installed in vtlb_Core_Alloc.
 // Never query the OS or initialize a local static from the fault handler.
 static vtlbProtection::Granularity s_protection_granularity{};
+
+// Reservations keep compile-time alignment. Only the standalone POSIX path
+// maps their contents at the runtime kernel granularity; Windows placeholders
+// and the libretro build retain the existing mapping behavior.
+#if defined(ARMSX2_STANDALONE_FASTMEM_OPTIMIZATIONS) && !defined(_WIN32)
+#define ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+// Recorded guest translations need not have an OS mapping (e.g. incomplete
+// 16K groups). Track successful Map calls separately so protection and Unmap
+// operate only on actual mappings. One bit per kernel page: 128 KiB at 4K.
+static std::vector<bool> s_fastmem_mapped_pages;
+#endif
 
 // Sticky: the 4 GB fastmem area allocation failed on this device at least once.
 // Process-lifetime flag so LoadSettings's config reload can't silently re-enable
@@ -841,52 +853,57 @@ __fi u32 vtlb_V2P(u32 vaddr)
 	return paddr;
 }
 
-static constexpr bool vtlb_MismatchedHostPageSize()
+static u32 vtlb_FastmemMappingSize()
 {
-	return (__pagesize != VTLB_PAGE_SIZE);
-}
-
-static u32 vtlb_HostPage(u32 page)
-{
-	if constexpr (!vtlb_MismatchedHostPageSize())
-		return page;
-
-	return page >> (__pageshift - VTLB_PAGE_BITS);
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+	return s_protection_granularity.size;
+#else
+	return __pagesize;
+#endif
 }
 
 static u32 vtlb_HostAlignOffset(u32 offset)
 {
-	if constexpr (!vtlb_MismatchedHostPageSize())
-		return offset;
-
-	return offset & ~__pagemask;
+	return offset & ~(vtlb_FastmemMappingSize() - 1);
 }
 
 static bool vtlb_IsHostCoalesced(u32 page)
 {
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+	return vtlbFastmem::IsCoalesced(s_fastmem_virtual_mapping, page, vtlb_FastmemMappingSize(), VTLB_PAGE_SIZE);
+#else
 	if constexpr (__pagesize == VTLB_PAGE_SIZE)
-	{
 		return true;
-	}
 	else
+		return vtlbFastmem::IsCoalesced(s_fastmem_virtual_mapping, page, __pagesize, VTLB_PAGE_SIZE);
+#endif
+}
+
+static bool vtlb_IsFastmemMapped(u32 page)
+{
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+	return s_fastmem_mapped_pages[(page * VTLB_PAGE_SIZE) >> s_protection_granularity.shift];
+#else
+	return vtlb_IsHostCoalesced(page);
+#endif
+}
+
+static void vtlb_UnmapFastmemPage(u32 page)
+{
+	const u32 offset = vtlb_HostAlignOffset(page * VTLB_PAGE_SIZE);
+	if (!s_fastmem_area->Unmap(s_fastmem_area->OffsetPointer(offset), vtlb_FastmemMappingSize()))
 	{
-		static constexpr u32 shift = __pageshift - VTLB_PAGE_BITS;
-		static constexpr u32 count = (1u << shift);
-		static constexpr u32 mask = count - 1;
-
-		const u32 base = page & ~mask;
-		const u32 base_offset = s_fastmem_virtual_mapping[base];
-		if ((base_offset & __pagemask) != 0)
-			return false;
-
-		for (u32 i = 0, expected_offset = base_offset; i < count; i++, expected_offset += VTLB_PAGE_SIZE)
-		{
-			if (s_fastmem_virtual_mapping[base + i] != expected_offset)
-				return false;
-		}
-
-		return true;
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+		// Leaving the old writable translation reachable would expose stale guest
+		// memory after a TLB remap. Refuse to continue with an inconsistent map.
+		AbortWithMessage("Failed to remove a fastmem mapping.");
+#else
+		Console.Error("Failed to unmap vaddr %08X", offset);
+#endif
 	}
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+	s_fastmem_mapped_pages[offset >> s_protection_granularity.shift] = false;
+#endif
 }
 
 static bool vtlb_GetMainMemoryOffsetFromPtr(uptr ptr, u32* mainmem_offset, u32* mainmem_size, PageProtectionMode* prot)
@@ -965,11 +982,11 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 	{
 		// current mapping needs to be removed
 		const u32 old_mainmem_offset = s_fastmem_virtual_mapping[page];
-		const bool was_coalesced = vtlb_IsHostCoalesced(page);
+		const bool was_mapped = vtlb_IsFastmemMapped(page);
 
 		s_fastmem_virtual_mapping[page] = NO_FASTMEM_MAPPING;
-		if (was_coalesced && !s_fastmem_area->Unmap(s_fastmem_area->PagePointer(vtlb_HostPage(page)), __pagesize))
-			Console.Error("Failed to unmap vaddr %08X", vaddr);
+		if (was_mapped)
+			vtlb_UnmapFastmemPage(page);
 
 		// remove reverse mapping
 		auto range = s_fastmem_physical_mapping.equal_range(old_mainmem_offset);
@@ -984,30 +1001,34 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 	s_fastmem_virtual_mapping[page] = mainmem_offset;
 	if (vtlb_IsHostCoalesced(page))
 	{
-		const u32 host_page = vtlb_HostPage(page);
+		const u32 host_address = vtlb_HostAlignOffset(vaddr);
 		const u32 host_offset = vtlb_HostAlignOffset(mainmem_offset);
+		const u32 mapping_size = vtlb_FastmemMappingSize();
 
 		if (!s_fastmem_area->Map(SysMemory::GetDataFileHandle(), host_offset,
-				s_fastmem_area->PagePointer(host_page), __pagesize, mode))
+				s_fastmem_area->OffsetPointer(host_address), mapping_size, mode))
 		{
 			Console.Error("Failed to map vaddr %08X to mainmem offset %08X", vtlb_HostAlignOffset(vaddr), host_offset);
 			s_fastmem_virtual_mapping[page] = NO_FASTMEM_MAPPING;
 			return;
 		}
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+		s_fastmem_mapped_pages[host_address >> s_protection_granularity.shift] = true;
+#endif
 
-		// A mapping still spans __pagesize, but its SMC permissions can differ
+		// Legacy mappings may span __pagesize, but their SMC permissions can differ
 		// between runtime pages. Restore every sub-page after a map/remap; using
 		// only the last guest page's mode could make protected code writable.
-		if (s_protection_granularity.size < __pagesize &&
+		if (s_protection_granularity.size < mapping_size &&
 			host_offset >= HostMemoryMap::EEmemOffset &&
 			(host_offset - HostMemoryMap::EEmemOffset) < Ps2MemSize::ExposedRam)
 		{
-			for (u32 offset = 0; offset < __pagesize; offset += s_protection_granularity.size)
+			for (u32 offset = 0; offset < mapping_size; offset += s_protection_granularity.size)
 			{
 				const bool writable = mmap_GetRamPageInfo(host_offset - HostMemoryMap::EEmemOffset + offset) != ProtMode_Write;
 				if (writable != mode.CanWrite())
 				{
-					HostSys::MemProtect(s_fastmem_area->PagePointer(host_page) + offset,
+					HostSys::MemProtect(s_fastmem_area->OffsetPointer(host_address) + offset,
 						s_protection_granularity.size, PageAccess_ReadOnly().Write(writable));
 				}
 			}
@@ -1024,12 +1045,12 @@ static void vtlb_RemoveFastmemMapping(u32 vaddr)
 		return;
 
 	const u32 mainmem_offset = s_fastmem_virtual_mapping[page];
-	const bool was_coalesced = vtlb_IsHostCoalesced(page);
+	const bool was_mapped = vtlb_IsFastmemMapped(page);
 	FASTMEM_LOG("Remove fastmem mapping @ vaddr %08X mainmem %08X", vaddr, mainmem_offset);
 	s_fastmem_virtual_mapping[page] = NO_FASTMEM_MAPPING;
 
-	if (was_coalesced && !s_fastmem_area->Unmap(s_fastmem_area->PagePointer(vtlb_HostPage(page)), __pagesize))
-		Console.Error("Failed to unmap vaddr %08X", vtlb_HostAlignOffset(vaddr));
+	if (was_mapped)
+		vtlb_UnmapFastmemPage(page);
 
 	// remove from reverse map
 	auto range = s_fastmem_physical_mapping.equal_range(mainmem_offset);
@@ -1071,11 +1092,8 @@ static void vtlb_RemoveFastmemMappings()
 		if (s_fastmem_virtual_mapping[page] == NO_FASTMEM_MAPPING)
 			continue;
 
-		if (vtlb_IsHostCoalesced(page))
-		{
-			if (!s_fastmem_area->Unmap(s_fastmem_area->PagePointer(vtlb_HostPage(page)), __pagesize))
-				Console.Error("Failed to unmap vaddr %08X", page * __pagesize);
-		}
+		if (vtlb_IsFastmemMapped(page))
+			vtlb_UnmapFastmemPage(page);
 
 		s_fastmem_virtual_mapping[page] = NO_FASTMEM_MAPPING;
 	}
@@ -1157,7 +1175,7 @@ void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
 				FASTMEM_LOG("  valias %08X (size %u)", it->second, VTLB_PAGE_SIZE);
 
 				if (s_protection_granularity.IsAligned(it->second) &&
-					vtlb_IsHostCoalesced(it->second / VTLB_PAGE_SIZE))
+					vtlb_IsFastmemMapped(it->second / VTLB_PAGE_SIZE))
 				{
 					HostSys::MemProtect(s_fastmem_area->OffsetPointer(it->second), s_protection_granularity.size, prot);
 				}
@@ -1186,7 +1204,7 @@ void vtlb_UpdateFastmemProtection(u32 paddr, u32 size, PageProtectionMode prot)
 			FASTMEM_LOG("  valias %08X (size %u)", it->second, VTLB_PAGE_SIZE);
 
 			if (s_protection_granularity.IsAligned(it->second) &&
-				vtlb_IsHostCoalesced(it->second / VTLB_PAGE_SIZE))
+				vtlb_IsFastmemMapped(it->second / VTLB_PAGE_SIZE))
 				offsets.push_back(it->second);
 		}
 	}
@@ -1498,6 +1516,9 @@ bool vtlb_Core_Alloc()
 	if (s_fastmem_area)
 	{
 		s_fastmem_virtual_mapping.resize(FASTMEM_PAGE_COUNT, NO_FASTMEM_MAPPING);
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+		s_fastmem_mapped_pages.assign(FASTMEM_AREA_SIZE / s_protection_granularity.size, false);
+#endif
 		vtlbdata.fastmem_base = (uptr)s_fastmem_area->BasePointer();
 		DevCon.WriteLn(Color_StrongGreen, "Fastmem area: %p - %p",
 			vtlbdata.fastmem_base, vtlbdata.fastmem_base + (FASTMEM_AREA_SIZE - 1));
@@ -1541,6 +1562,9 @@ void vtlb_Core_Free()
 	vtlbdata.fastmem_base = 0;
 	decltype(s_fastmem_physical_mapping)().swap(s_fastmem_physical_mapping);
 	decltype(s_fastmem_virtual_mapping)().swap(s_fastmem_virtual_mapping);
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+	decltype(s_fastmem_mapped_pages)().swap(s_fastmem_mapped_pages);
+#endif
 	s_fastmem_area.reset();
 }
 
@@ -1679,7 +1703,25 @@ PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exceptio
 		// match ProtMode_Write we walk into mmap_ClearCpuBlock and write a
 		// ProtMode over whatever follows the array. The branch below has always
 		// had this check; this one never did.
-		uptr ptr = (uptr)PSM(vaddr);
+		uptr ptr;
+#ifdef ARMSX2_RUNTIME_FASTMEM_MAPPINGS
+		// Guest TLB aliases are not necessarily identity/KSEG translations.
+		// Classify the actual OS mapping, using its recorded shared-file offset.
+		ptr = 0;
+		const u32 guest_page = vaddr / VTLB_PAGE_SIZE;
+		if (vtlb_IsFastmemMapped(guest_page))
+		{
+			const u32 mapped_offset = s_fastmem_virtual_mapping[guest_page];
+			if (mapped_offset >= HostMemoryMap::EEmemOffset &&
+				mapped_offset - HostMemoryMap::EEmemOffset < Ps2MemSize::ExposedRam)
+			{
+				ptr = reinterpret_cast<uptr>(eeMem->Main) + mapped_offset - HostMemoryMap::EEmemOffset +
+					(vaddr & VTLB_PAGE_MASK);
+			}
+		}
+#else
+		ptr = (uptr)PSM(vaddr);
+#endif
 		uptr offset = (ptr - (uptr)eeMem->Main);
 		if (ptr && offset < Ps2MemSize::ExposedRam &&
 			m_PageProtectInfo[s_protection_granularity.Index(offset)].Mode == ProtMode_Write)

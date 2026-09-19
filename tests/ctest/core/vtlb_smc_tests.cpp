@@ -57,6 +57,53 @@ namespace
 	};
 } // namespace
 
+#ifdef ARMSX2_STANDALONE_FASTMEM_OPTIMIZATIONS
+TEST_F(VtlbSmc, NonIdentityTlbAliasInvalidatesItsMappedPhysicalPage)
+{
+	constexpr u32 alias = 0x30004000;
+	const u32 physical = 2 * page_size;
+	vtlb_VMap(alias, physical, page_size);
+	mmap_MarkCountedRamPage(physical);
+	*reinterpret_cast<volatile u32*>(vtlb_private::vtlbdata.fastmem_base + alias + 4) = 0x12345678;
+	EXPECT_EQ(clear_calls, 1u);
+	EXPECT_EQ(clear_address, physical);
+	EXPECT_EQ(clear_words * sizeof(u32), page_size);
+	EXPECT_EQ(*reinterpret_cast<u32*>(eeMem->Main + physical + 4), 0x12345678u);
+	EXPECT_EQ(mmap_GetRamPageInfo(physical), ProtMode_Manual);
+}
+
+TEST_F(VtlbSmc, Independent4KPagesMapRemapAndUnmapWithoutNeighbours)
+{
+	if (page_size != 0x1000)
+		GTEST_SKIP() << "Requires an actual 4K kernel to exercise sub-16K mmap.";
+	constexpr u32 alias = 0x30001000;
+	constexpr u32 physical = 0x5000;
+	constexpr u32 neighbour = 0xb000;
+	vtlb_VMap(alias, physical, page_size);
+	vtlb_VMap(alias + page_size, neighbour, page_size);
+	auto* first = reinterpret_cast<volatile u32*>(vtlb_private::vtlbdata.fastmem_base + alias);
+	auto* second = reinterpret_cast<volatile u32*>(vtlb_private::vtlbdata.fastmem_base + alias + page_size);
+	*first = 0x11111111;
+	*second = 0x22222222;
+	EXPECT_EQ(*reinterpret_cast<u32*>(eeMem->Main + physical), 0x11111111u);
+	EXPECT_EQ(*reinterpret_cast<u32*>(eeMem->Main + neighbour), 0x22222222u);
+
+	mmap_MarkCountedRamPage(physical);
+	*first = 0x33333333;
+	EXPECT_EQ(clear_calls, 1u);
+	EXPECT_EQ(clear_address, physical);
+	vtlb_VMap(alias, 0x15000, page_size);
+	*first = 0x44444444;
+	EXPECT_EQ(*reinterpret_cast<u32*>(eeMem->Main + physical), 0x33333333u);
+	EXPECT_EQ(*reinterpret_cast<u32*>(eeMem->Main + 0x15000), 0x44444444u);
+	vtlb_VMapUnmap(alias, page_size);
+	*second = 0x55555555;
+	EXPECT_EQ(*reinterpret_cast<u32*>(eeMem->Main + neighbour), 0x55555555u);
+	using Result = PageFaultHandler::HandlerResult;
+	EXPECT_EQ(PageFaultHandler::HandlePageFault(nullptr, const_cast<u32*>(first), true), Result::ExecuteNextHandler);
+}
+#endif
+
 TEST_F(VtlbSmc, FaultInvalidatesOnlyOneRuntimePageAndCanReprotect)
 {
 	for (u32 offset = 0; offset < 2 * __pagesize; offset += page_size)

@@ -16,6 +16,14 @@ void Host::CommitBaseSettingChanges()
 {
 }
 
+#ifdef ENABLE_LIBRETRO
+// The frontend supplies this callback in a libretro core; standalone test
+// executables link the same core objects without the frontend.
+void Host::SetPadVibration(u32 pad_index, float large_motor, float small_motor)
+{
+}
+#endif
+
 void Host::LoadSettings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
 {
 }

@@ -22,14 +22,12 @@
 //     fast-path stubs, the SMC-clear path inside the store stub, and an
 //     interpreter fallback (the GTE ops are the IOP's only REC_FUNC users).
 //
-// One gap worth naming, because a mutation test finds it: deleting the RELOAD
-// half of the stubs' pair does not fail anything here. It is still required.
-// An IOP MMIO write can reach PSX_INT -> cpuSetNextEventDelta -> cpuTestINTCInts
-// (R5900.cpp), which sets psxRegs.iopCycleEE = 0 to cut the IOP's timeslice
-// short — but only while eeEventTestIsActive, i.e. when the EE is driving the
-// IOP through cpuEventTest. This harness runs the IOP standalone, so that flag
-// is never set and the value C writes always matches the one already in the
-// register. Reproducing it needs an EE-driven run, which is a different harness.
+// The SBUS tests also check the RELOAD half of the pair: a real write to
+// HW_ICFG reaches hwIntcIrq(INTC_SBUS) -> cpuTestINTCInts, which clears the IOP's
+// remaining budget while the EE event test is active. Recreate that scheduling
+// state around the standalone harness; no replacement handler or JIT hook is
+// needed. PSX_INT -> cpuSetNextEventDelta only schedules an EE event and does
+// not itself shorten iopCycleEE.
 //
 // Every run here is budget-bounded rather than program-bounded — the harness
 // hands ExecuteBlock a fixed EE-cycle budget and the JIT runs until iopCycleEE
@@ -37,6 +35,12 @@
 // readout of whether the accounting stayed intact across the seam.
 
 #include "harness/JitTestHarness.h"
+
+#include "Hw.h"
+#include "IopHw.h"
+#include "Memory.h"
+#include "R5900.h"
+#include "Dmac.h"
 
 #include <gtest/gtest.h>
 
@@ -72,6 +76,108 @@ void ExpectCycleAccountingIntact(JitTestHarness& h)
 	EXPECT_LE(h.JitSnapshot().regs.iopCycleEE, 0)
 		<< "the EE timeslice was not consumed, or iopCycleEE was never published "
 		   "out of RPSXEECYCLE";
+}
+
+// JitTestHarness restores the IOP register file between runs, but these tests
+// also touch EE interrupt state and IOP hardware. Keep those changes local.
+class ScopedSbusInterruptState
+{
+public:
+	ScopedSbusInterruptState(bool event_test_active, bool masked, bool interrupts_enabled)
+		: saved_cpu_regs_(cpuRegs)
+		, saved_event_test_active_(eeEventTestIsActive)
+		, saved_intc_stat_(psHu32(INTC_STAT))
+		, saved_intc_mask_(psHu32(INTC_MASK))
+		, saved_icfg_(psxHu32(HW_ICFG))
+	{
+		cpuRegs.CP0.n.Status.val = interrupts_enabled ? 0x10401u : 0u; // EIE, INTC, IE
+		cpuRegs.cycle = 1000;
+		cpuRegs.nextEventCycle = cpuRegs.cycle + 100;
+		eeEventTestIsActive = event_test_active;
+		psHu32(INTC_STAT) = 0;
+		psHu32(INTC_MASK) = masked ? 0u : (1u << INTC_SBUS);
+		psxHu32(HW_ICFG) = 0; // PS2's 1:8 clock ratio, no PS1-mode transition
+	}
+
+	~ScopedSbusInterruptState()
+	{
+		cpuRegs = saved_cpu_regs_;
+		eeEventTestIsActive = saved_event_test_active_;
+		psHu32(INTC_STAT) = saved_intc_stat_;
+		psHu32(INTC_MASK) = saved_intc_mask_;
+		psxHu32(HW_ICFG) = saved_icfg_;
+	}
+
+private:
+	cpuRegisters saved_cpu_regs_;
+	bool saved_event_test_active_;
+	u32 saved_intc_stat_;
+	u32 saved_intc_mask_;
+	u32 saved_icfg_;
+};
+
+void RunSbusWrite(bool event_test_active, bool masked, bool interrupts_enabled, bool delay_slot)
+{
+	for (const bool halfword : {false, true})
+	{
+		SCOPED_TRACE(halfword ? "SH" : "SW");
+		ScopedSbusInterruptState interrupt_state(event_test_active, masked, interrupts_enabled);
+		JitTestHarness h;
+		h.SetGpr(reg::a0, HW_ICFG);
+		h.SetGpr(reg::v1, 1u << 1);
+		// Avoid unrelated IOP events. The production SBUS handler affects EE
+		// INTC only; no EE execution is needed to observe its budget change.
+		psxRegs.iopNextEventCycle = 0x100000;
+		const u32 store = halfword ? SH(reg::v1, 0, reg::a0) : SW(reg::v1, 0, reg::a0);
+		if (delay_slot)
+		{
+			h.LoadProgramNoTerm({
+				ADDIU(reg::v0, reg::zero, 0x11), BEQ(reg::zero, reg::zero, 1), NOP,
+				ADDIU(reg::v0, reg::v0, 1), JR(reg::ra), store,
+			});
+		}
+		else
+		{
+			h.LoadProgramNoTerm({
+				ADDIU(reg::v0, reg::zero, 0x11), BEQ(reg::zero, reg::zero, 1), NOP,
+				store, ADDIU(reg::v0, reg::v0, 1), JR(reg::ra), NOP,
+			});
+		}
+		h.Run();
+
+		EXPECT_EQ(h.GetGprJit(reg::v0), 0x12u);
+		EXPECT_EQ(psHu32(INTC_STAT), 1u << INTC_SBUS);
+		EXPECT_EQ(psxHu32(HW_ICFG), 1u << 1);
+		const auto& jit = h.JitSnapshot().regs;
+		const auto& interp = h.InterpSnapshot().regs;
+		if (event_test_active && !masked && interrupts_enabled)
+		{
+			// The first three instructions consumed 24 EE cycles. The helper
+			// returns the remaining budget through iopBreak, and execution
+			// stops at this block's branch rather than entering the parking
+			// loop. A stale resident budget would keep executing that loop.
+			const u64 instruction_count = delay_slot ? 6u : 7u;
+			EXPECT_EQ(jit.cycle, instruction_count);
+			EXPECT_EQ(jit.cycle, interp.cycle);
+			EXPECT_GT(jit.iopBreak, 0);
+			EXPECT_EQ(jit.iopBreak, interp.iopBreak);
+			EXPECT_EQ(jit.iopCycleEE, -static_cast<s32>((instruction_count - 3) * 8));
+			EXPECT_EQ(jit.iopCycleEE, interp.iopCycleEE);
+			EXPECT_EQ(cpuRegs.nextEventCycle, cpuRegs.cycle + 4);
+		}
+		else
+		{
+			// Pending SBUS alone must not steal a timeslice when the EE event
+			// test is inactive, the line is masked, or CP0 disables interrupts.
+			EXPECT_EQ(jit.iopBreak, 0);
+			EXPECT_EQ(interp.iopBreak, 0);
+			ExpectCycleAccountingIntact(h);
+			if (masked || !interrupts_enabled)
+				EXPECT_EQ(cpuRegs.nextEventCycle, cpuRegs.cycle + 100);
+			else
+				EXPECT_EQ(cpuRegs.nextEventCycle, cpuRegs.cycle + 4);
+		}
+	}
 }
 } // namespace
 
@@ -143,4 +249,29 @@ TEST(IopCycleResidency, SurvivesInterpreterFallback)
 	h.LoadProgram({MFC2(reg::v0, 0)});
 	h.Run();
 	ExpectCycleAccountingIntact(h);
+}
+
+TEST(IopCycleResidency, ReloadsBudgetShortenedBySbusStore)
+{
+	RunSbusWrite(true, false, true, false);
+}
+
+TEST(IopCycleResidency, ReloadsBudgetShortenedByDelaySlotSbusStore)
+{
+	RunSbusWrite(true, false, true, true);
+}
+
+TEST(IopCycleResidency, SbusOutsideEeEventTestPreservesBudget)
+{
+	RunSbusWrite(false, false, true, false);
+}
+
+TEST(IopCycleResidency, MaskedSbusPreservesBudget)
+{
+	RunSbusWrite(true, true, true, false);
+}
+
+TEST(IopCycleResidency, SbusWithDisabledEeInterruptsPreservesBudget)
+{
+	RunSbusWrite(true, false, false, false);
 }
