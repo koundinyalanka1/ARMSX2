@@ -173,15 +173,39 @@ if(NOT EXISTS "${_lrs_cxx_shared}")
 		"liblibrashader_capi.so links it dynamically, so shipping without it bricks boot.")
 endif()
 
-if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-	add_custom_command(TARGET librashader_cargo POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_lrs_lib}" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_lrs_cxx_shared}" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
-		COMMENT "librashader: staging liblibrashader_capi.so + libc++_shared.so for packaging"
-		VERBATIM
-	)
+# CMAKE_LIBRARY_OUTPUT_DIRECTORY is set by AGP, not by this CMakeLists — nothing in the
+# Android entry path assigns it. So it is set for a Gradle build and EMPTY for a bare
+# `cmake -S platforms/android/app/src/main/cpp` invocation, which is how standalone
+# consumers (the libretro core, CI one-offs, bisects) build this tree.
+#
+# That used to mean the staging below was skipped SILENTLY. The build then succeeded,
+# emitted a core with a DT_NEEDED on liblibrashader_capi.so, and left that .so sitting in
+# the cargo target dir where no consumer looks — so every launch died at dlopen with
+#   library "liblibrashader_capi.so" not found: needed by <core>.so
+# and nothing in the build log hinted at it. A build that cannot place a hard runtime
+# dependency has produced an unloadable artifact; say so at configure time rather than
+# handing back a binary that bricks on the device. Same reasoning as the libc++_shared.so
+# FATAL_ERROR above, and the message names both ways out.
+if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+	message(FATAL_ERROR
+		"librashader: CMAKE_LIBRARY_OUTPUT_DIRECTORY is not set, so liblibrashader_capi.so "
+		"(and the libc++_shared.so it links) cannot be staged for packaging. The core would "
+		"record a DT_NEEDED on a library that ships nowhere and fail to dlopen on device.\n"
+		"  * Building through Gradle/AGP? It sets this for you — this should not happen.\n"
+		"  * Building standalone and you WANT shader chains? Pass "
+		"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=<dir> and package both .so files from there "
+		"alongside the core.\n"
+		"  * Building standalone and you DON'T need shader chains? Pass "
+		"-DARMSX2_DISABLE_LIBRASHADER=ON to compile the feature out.")
 endif()
+
+add_custom_command(TARGET librashader_cargo POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_lrs_lib}" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_lrs_cxx_shared}" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
+	COMMENT "librashader: staging liblibrashader_capi.so + libc++_shared.so for packaging"
+	VERBATIM
+)
 
 add_library(librashader SHARED IMPORTED GLOBAL)
 set_target_properties(librashader PROPERTIES IMPORTED_LOCATION "${_lrs_lib}")
