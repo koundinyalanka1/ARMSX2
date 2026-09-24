@@ -1876,6 +1876,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 	bool supports_achievements = true;
 	environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &supports_achievements);
 
+	// retro_serialize_size is answered from here on, but retro_serialize and
+	// retro_unserialize fail until the VM has booted, which with a hardware
+	// context is only after the frontend's context_reset. Say so.
+	uint64_t serialization_quirks = RETRO_SERIALIZATION_QUIRK_MUST_INITIALIZE;
+	environ_cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &serialization_quirks);
+
 	if (!LibretroCore::InitializeConfig())
 	{
 		log_cb(RETRO_LOG_ERROR, "Failed to initialize config.\n");
@@ -2458,7 +2464,15 @@ static constexpr size_t kSerializeSize = 68 * 1024 * 1024;
 
 RETRO_API size_t retro_serialize_size(void)
 {
-	return VMManager::HasValidVM() ? kSerializeSize : 0;
+	// For the whole of a loaded game, not only once the VM is up. With a
+	// hardware context the VM boots after the frontend's context_reset, which
+	// comes after retro_load_game returns - and that return is exactly when a
+	// frontend sizes its state buffer (RetroPal's host reads this once, there,
+	// and never again). Answering 0 then leaves it with no buffer and save
+	// states that can never work; it also breaks libretro's rule that the size
+	// may not grow between load and unload. retro_serialize itself still fails
+	// until the VM has booted, which SET_SERIALIZATION_QUIRKS announces.
+	return LibretroCore::s_cpu_thread.joinable() ? kSerializeSize : 0;
 }
 
 RETRO_API bool retro_serialize(void* data, size_t size)
@@ -2488,7 +2502,12 @@ RETRO_API bool retro_serialize(void* data, size_t size)
 			Console.ErrorFmt("retro_serialize: DownloadState failed: {}", error.GetDescription());
 			return;
 		}
-		ok = SaveState_ZipToBuffer(std::move(elist), SaveState_SaveScreenshot(), &buffer, &error);
+		// No screenshot. It is there for PCSX2's own save-slot previews, and a
+		// libretro state is an opaque blob no frontend looks inside - so it
+		// would only cost a GS round trip, a readback and a PNG encode on every
+		// save, the case where that matters most being a frontend's rewind or
+		// quick-save.
+		ok = SaveState_ZipToBuffer(std::move(elist), nullptr, &buffer, &error);
 		if (!ok)
 			Console.ErrorFmt("retro_serialize: ZipToBuffer failed: {}", error.GetDescription());
 	}, true);
