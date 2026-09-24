@@ -157,6 +157,16 @@ namespace LibretroCore
 		u32 frame_height = kFrameHeight;
 	};
 	static PresentedState s_presented;
+
+	// Rumble strengths the CPU thread asked for, sent from retro_run. The pad
+	// asks from the CPU thread, and libretro callbacks belong on the thread
+	// that calls retro_run: an Android frontend reaching its vibrator through
+	// JNI cannot take the call from a native thread the JVM has never seen.
+	static constexpr u32 kRumbleMotors = 2; // RETRO_RUMBLE_STRONG, RETRO_RUMBLE_WEAK
+	static std::atomic<u16> s_rumble_wanted[Pad::NUM_CONTROLLER_PORTS][kRumbleMotors];
+	static u16 s_rumble_sent[Pad::NUM_CONTROLLER_PORTS][kRumbleMotors];
+	static void SendRumble();
+	static void StopRumble();
 } // namespace LibretroCore
 
 // Settings persistence (INI under the frontend's system directory).
@@ -386,22 +396,8 @@ void Host::SetMouseLock(bool state)
 
 void Host::SetPadVibration(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity)
 {
-	if (!rumble_cb)
+	if (!rumble_cb || pad_index >= Pad::NUM_CONTROLLER_PORTS)
 		return;
-
-	// Deduped because the pad re-sends its vibration state on every poll the game
-	// makes, not only when it changes, and set_rumble_state reaches the frontend's
-	// input driver. InputManager cannot do this for us: its own dedup lives in the
-	// per-motor bindings, and the core has none of those.
-	static float s_last[Pad::NUM_CONTROLLER_PORTS][2] = {};
-	if (s_last[pad_index][0] == large_or_single_motor_intensity &&
-		s_last[pad_index][1] == small_motor_intensity)
-	{
-		return;
-	}
-
-	s_last[pad_index][0] = large_or_single_motor_intensity;
-	s_last[pad_index][1] = small_motor_intensity;
 
 	// Clamped rather than trusted: the scale is the full u16 range, so a stray
 	// intensity above 1 would wrap to a near-zero strength instead of saturating.
@@ -409,10 +405,48 @@ void Host::SetPadVibration(u32 pad_index, float large_or_single_motor_intensity,
 		return static_cast<u16>(std::clamp(intensity, 0.0f, 1.0f) * 65535.0f + 0.5f);
 	};
 
-	// STRONG is the large (low-frequency) motor, WEAK the small one - the same
-	// order this function takes them in.
-	rumble_cb(pad_index, RETRO_RUMBLE_STRONG, to_strength(large_or_single_motor_intensity));
-	rumble_cb(pad_index, RETRO_RUMBLE_WEAK, to_strength(small_motor_intensity));
+	// Runs on the CPU thread, so this only records the request; retro_run sends
+	// it (LibretroCore::SendRumble). STRONG is the large (low-frequency) motor,
+	// WEAK the small one - the same order this function takes them in.
+	LibretroCore::s_rumble_wanted[pad_index][RETRO_RUMBLE_STRONG].store(
+		to_strength(large_or_single_motor_intensity), std::memory_order_relaxed);
+	LibretroCore::s_rumble_wanted[pad_index][RETRO_RUMBLE_WEAK].store(
+		to_strength(small_motor_intensity), std::memory_order_relaxed);
+}
+
+void LibretroCore::SendRumble()
+{
+	if (!rumble_cb)
+		return;
+
+	// Deduped because the pad re-sends its vibration state on every poll the
+	// game makes, not only when it changes, and set_rumble_state reaches the
+	// frontend's input driver. InputManager cannot do this for us: its own dedup
+	// lives in the per-motor bindings, and the core has none of those.
+	for (u32 port = 0; port < Pad::NUM_CONTROLLER_PORTS; port++)
+	{
+		for (u32 motor = 0; motor < kRumbleMotors; motor++)
+		{
+			const u16 wanted = s_rumble_wanted[port][motor].load(std::memory_order_relaxed);
+			if (wanted == s_rumble_sent[port][motor])
+				continue;
+
+			rumble_cb(port, static_cast<retro_rumble_effect>(motor), wanted);
+			s_rumble_sent[port][motor] = wanted;
+		}
+	}
+}
+
+void LibretroCore::StopRumble()
+{
+	// Nothing will poll the pads once the VM is gone, so a motor left running
+	// here keeps running until the frontend's next game happens to reset it.
+	for (u32 port = 0; port < Pad::NUM_CONTROLLER_PORTS; port++)
+	{
+		for (u32 motor = 0; motor < kRumbleMotors; motor++)
+			s_rumble_wanted[port][motor].store(0, std::memory_order_relaxed);
+	}
+	SendRumble();
 }
 
 std::optional<WindowInfo> Host::AcquireRenderWindow(bool recreate_window)
@@ -2255,6 +2289,9 @@ RETRO_API void retro_unload_game(void)
 	if (LibretroCore::s_cpu_thread.joinable())
 		LibretroCore::s_cpu_thread.join();
 
+	// After the join, so nothing on the CPU thread can ask for rumble again.
+	LibretroCore::StopRumble();
+
 	s_base_settings.reset();
 	s_secrets_settings.reset();
 	LibretroCore::s_content_path.clear();
@@ -2464,6 +2501,8 @@ RETRO_API void retro_run(void)
 			environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
 		}
 	}
+
+	LibretroCore::SendRumble();
 
 	// M3 audio: drain whatever SPU2 mixed since the last retro_run out of the
 	// (null-backend) stream ring and hand it to the frontend.
