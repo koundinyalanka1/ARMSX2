@@ -186,6 +186,11 @@ namespace Host
 		/// Sets the secrets settings layer. Should follow call to SetBaseSettingsLayer.
 		void SetSecretsSettingsLayer(SettingsInterface* sif);
 
+		/// Detaches the base and secrets layers, for a host that destroys the objects behind
+		/// them and may set new ones later (the libretro core, between games). Must call with
+		/// the lock held.
+		void ClearBaseAndSecretsSettingsLayers(std::unique_lock<std::mutex>& settings_lock);
+
 		/// Sets the game settings layer. Called by VMManager when the game changes.
 		void SetGameSettingsLayer(SettingsInterface* sif, std::unique_lock<std::mutex>& settings_lock);
 

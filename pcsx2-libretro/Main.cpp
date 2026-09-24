@@ -2292,6 +2292,15 @@ RETRO_API void retro_unload_game(void)
 	// After the join, so nothing on the CPU thread can ask for rumble again.
 	LibretroCore::StopRumble();
 
+	// The Host still points at both of these. Detach them before they go: a
+	// frontend that keeps the core loaded between games would otherwise abort
+	// on the next retro_load_game ("Base layer has already been set" is a
+	// release assertion), and any settings read in between would be reading
+	// freed memory.
+	{
+		auto lock = Host::GetSettingsLock();
+		Host::Internal::ClearBaseAndSecretsSettingsLayers(lock);
+	}
 	s_base_settings.reset();
 	s_secrets_settings.reset();
 	LibretroCore::s_content_path.clear();

@@ -434,6 +434,12 @@ void Host::Internal::SetSecretsSettingsLayer(SettingsInterface* sif)
 	s_layered_settings_interface.SetLayer(LayeredSettingsInterface::LAYER_SECRETS, sif);
 }
 
+void Host::Internal::ClearBaseAndSecretsSettingsLayers(std::unique_lock<std::mutex>& settings_lock)
+{
+	s_layered_settings_interface.SetLayer(LayeredSettingsInterface::LAYER_SECRETS, nullptr);
+	s_layered_settings_interface.SetLayer(LayeredSettingsInterface::LAYER_BASE, nullptr);
+}
+
 void Host::Internal::SetGameSettingsLayer(SettingsInterface* sif, std::unique_lock<std::mutex>& settings_lock)
 {
 	s_layered_settings_interface.SetLayer(LayeredSettingsInterface::LAYER_GAME, sif);
