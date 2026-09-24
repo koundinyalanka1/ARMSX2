@@ -316,6 +316,15 @@ enum class GSRendererType : s8
 	VK = 14,
 	Metal = 17,
 	DX12 = 15,
+
+	// GSRendererHW paired with the deviceless GSDeviceNone: the hardware renderer's CPU-side
+	// path (GIF decode, vertex kick, texture cache, everything Draw() does to build a
+	// submission) with no GPU behind it. Distinct from Null, which pairs GSDeviceNone with
+	// GSRendererNull and draws nothing at all -- reusing Null here would make GSIsHardwareRenderer(),
+	// UseHardwareRenderer() and every "renderer == Null" check in GS.cpp/GSState.cpp answer as if
+	// nothing were running, when GSRendererHW's real CPU logic is. pcsx2-gsrunner only
+	// (`-renderer nullhw`); deliberately not added to any Qt/ImGui renderer picker.
+	NullHW = 18,
 };
 
 enum class GSVSyncMode : u8
@@ -587,10 +596,12 @@ enum class GSDepthFeedbackMode : u8
 	DepthAsRT = 3,
 };
 
-// GV-7 GS front/back split. Off = today's single-threaded path with no record
+// GS front/back split. Off = the single-threaded path with no record
 // round-trip; InlineRecords = build + execute every record on the calling
-// thread (the GV7-0 shape — validation / bisect rung); Lockstep = back thread
-// runs but the front drains after every record; Pipelined = the real thing.
+// thread (a validation / bisect rung); Lockstep = back thread runs but the
+// front drains after every record (a bisect rung); Pipelined = a front thread
+// parses while a back thread draws. GSBackThreadPolicy.h decides what a
+// request resolves to.
 enum class GSBackThreadMode : u8
 {
 	Off           = 0,
@@ -898,14 +909,7 @@ struct Pcsx2Config
 					UseBlitSwapChain : 1,
 					DisableShaderCache : 1,
 					DisableFramebufferFetch : 1,
-					// Pretend the device has no dual-source blend unit, the way every Mali
-					// Vulkan blob reports it. GSRendererHW then takes the SRC1 substitution
-					// and SW-blend fallbacks, so a Mali-only blending bug reproduces on a
-					// desktop GPU instead of needing a device round-trip to see.
-					DisableDualSourceBlend : 1,
-					EnableAdrenoFramebufferFetch : 1,
 					ForceMaliFramebufferFetch : 1,
-					DisablePS2DepthQuantization : 1,
 					DisableVertexShaderExpand : 1,
 					SkipDuplicateFrames : 1,
 					OsdShowSpeed : 1,
@@ -1013,6 +1017,13 @@ struct Pcsx2Config
 		float UpscaleMultiplier = DEFAULT_UPSCALE_MULTIPLIER;
 
 		AccBlendLevel AccurateBlendingUnit = DEFAULT_BLENDING_ACCURACY;
+		/// The highest blending accuracy this title may run at while the device pays for its
+		/// destination read on every draw that takes one -- a copy of the render target, or a
+		/// barrier -- as AccBlendLevel's integer; -1 when the title asks for nothing, which is
+		/// every title but Splashdown. Written only by the game database
+		/// (copyRoadMaximumBlendingLevel) and read only by the GS, which is the side that knows
+		/// which road the device took. See GS/Renderers/Common/GSCopyRoadBlendingPolicy.h.
+		s8 CopyRoadMaximumBlendingLevel = -1;
 		BiFiltering TextureFiltering = DEFAULT_TEXTURE_FILTERING_MODE;
 		TexturePreloadingLevel TexturePreloading = TexturePreloadingLevel::Full;
 		GSDumpCompressionMethod GSDumpCompression = GSDumpCompressionMethod::Zstandard;
@@ -1044,7 +1055,12 @@ struct Pcsx2Config
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
+		/// The setting, as the user or the game database asked for it.
 		GSBackThreadMode BackThreadMode = GSBackThreadMode::Off;
+		/// What BackThreadMode resolved to for the open renderer. Derived, not loaded or saved, and
+		/// not compared -- set by OpenGSRenderer on GSConfig only, and read by the renderer's
+		/// constructor.
+		GSBackThreadMode BackThreadModeResolved = GSBackThreadMode::Off;
 
 		// RetroArch (.slangp) shader chain, applied at present after ShadeBoost/FXAA via
 		// librashader. Disabled or an empty preset skips the chain entirely (zero cost),
@@ -1519,6 +1535,11 @@ struct Pcsx2Config
 		static constexpr u32 MAXIMUM_NOTIFICATION_DURATION = 30;
 		static constexpr u32 DEFAULT_NOTIFICATION_DURATION = 5;
 		static constexpr u32 DEFAULT_LEADERBOARD_DURATION = 10;
+		// Size of the achievement popups and in-game indicators, as a percentage of the normal
+		// layout. ARMSX2: on a handheld the stock size was hard to read.
+		static constexpr u32 MINIMUM_NOTIFICATION_SCALE = 50;
+		static constexpr u32 MAXIMUM_NOTIFICATION_SCALE = 250;
+		static constexpr u32 DEFAULT_NOTIFICATION_SCALE = 100;
 
 		static const char* OverlayPositionNames[(size_t)AchievementOverlayPosition::MaxCount + 1];
 
@@ -1541,6 +1562,7 @@ struct Pcsx2Config
 
 		u32 NotificationsDuration = DEFAULT_NOTIFICATION_DURATION;
 		u32 LeaderboardsDuration = DEFAULT_LEADERBOARD_DURATION;
+		u32 NotificationScale = DEFAULT_NOTIFICATION_SCALE;
 		AchievementOverlayPosition OverlayPosition = AchievementOverlayPosition::BottomRight;
 		OsdOverlayPos NotificationPosition = OsdOverlayPos::TopLeft;
 

@@ -16,6 +16,8 @@
 #include "Input/InputManager.h"
 #include "MTGS.h"
 #include "pcsx2/GS.h"
+#include "GS/Renderers/Common/GSBackThreadPolicy.h"
+#include "GS/Renderers/Common/GSCopyRoadBlendingPolicy.h"
 #include "GS/Renderers/Null/GSDeviceNone.h"
 #include "GS/Renderers/Null/GSRendererNull.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
@@ -98,6 +100,10 @@ static RenderAPI GetAPIForRenderer(GSRendererType renderer)
 		// Null renderer pairs with the deviceless None host device — headless runs
 		// (eerunner A/B, CI) must not require a working Vulkan/GL context.
 		case GSRendererType::Null:
+		// Same deviceless host device, but paired with GSRendererHW below (OpenGSRenderer's
+		// `renderer != SW` branch already handles it, since NullHW is neither Null nor SW) --
+		// a per-title CPU-only cost measurement of the hardware renderer path.
+		case GSRendererType::NullHW:
 			return RenderAPI::None;
 
 		case GSRendererType::OGL:
@@ -225,6 +231,82 @@ static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
 	config.UpscaleMultiplier = static_cast<float>(max_upscale_multiplier);
 }
 
+// A title whose database entry caps its blending accuracy on a road that charges for the
+// destination read gets that cap applied here, where the device that decides whether the cap means
+// anything finally exists.
+//
+// Applied to GSConfig rather than to EmuConfig on purpose. The cap is a property of this device,
+// not of the player's settings: writing it back would make the settings screen show a level the
+// player never chose, raise the "blending accuracy is below Basic" unsafe-settings warning for a
+// database decision, and persist a device fact into an INI that may next be read on another GPU.
+// GSConfig is the renderer's own copy and is rebuilt from EmuConfig on every settings change, so
+// this runs again each time and nothing accumulates.
+//
+// Reasoning, measurements and the picture-quality judgement: GSCopyRoadBlendingPolicy.h.
+static void GSApplyCopyRoadBlendingCap(Pcsx2Config::GSOptions& config)
+{
+	// Blending accuracy is a hardware-renderer concept; the software renderer blends exactly and
+	// reads none of this, so leaving its level alone keeps the log and the OSD honest.
+	if (!GSIsHardwareRenderer() || config.CopyRoadMaximumBlendingLevel < 0)
+		return;
+
+	const GSDevice::FeatureSupport& f = g_gs_device->Features();
+
+	GSCopyRoadBlendingInputs in;
+	// The road, not the texture-barrier bit. A barrier road on a tiler charges for the destination
+	// read on every draw that takes one, the same as a copy road does -- which is what the bit
+	// cannot say, being equally true of the roads where the driver hands us the read for nothing.
+	// Which barrier roads charge is the backend's measured answer, not an inference: see
+	// barrier_read_costs_per_draw.
+	in.road = GSSelfReadRoadFromPublishedBits(
+		f.framebuffer_fetch, f.texture_barrier, f.declared_feedback_loop_orders_overlap);
+	in.multidraw_fb_copy = f.multidraw_fb_copy;
+	in.barrier_costs_per_draw = f.barrier_read_costs_per_draw;
+	in.title_cap = config.CopyRoadMaximumBlendingLevel;
+	in.configured_level = static_cast<int>(config.AccurateBlendingUnit);
+
+	const int level = CopyRoadBlendingLevel(in);
+	if (level == in.configured_level)
+		return;
+
+	static constexpr const char* blend_level_names[] = {
+		"Minimum", "Basic", "Medium", "High", "Full", "Maximum"};
+
+	Console.WriteLn("GS: this device pays for each destination read (%s), so the game database's "
+					"copy-road blending cap applies: blending accuracy %s -> %s.",
+		in.road == GSSelfReadRoad::InPassBarrier ? "a barrier per draw" : "a copy of the target per draw",
+		blend_level_names[in.configured_level], blend_level_names[level]);
+	config.AccurateBlendingUnit = static_cast<AccBlendLevel>(level);
+}
+
+// Resolves the back-thread setting for the renderer about to open, into GSConfig only, for the same
+// reason as the blending cap above: it depends on the device and the download mode, so it is
+// re-derived every time a renderer opens and never written back into the player's settings. Must run before the renderer
+// is constructed, because the renderer's constructor starts the back thread.
+static void GSResolveBackThreadMode(Pcsx2Config::GSOptions& config, GSRendererType renderer)
+{
+	GSBackThreadInputs in;
+	in.requested = config.BackThreadMode;
+	in.hardware_renderer = (renderer != GSRendererType::SW && renderer != GSRendererType::Null);
+	in.vulkan = g_gs_device && g_gs_device->GetRenderAPI() == RenderAPI::Vulkan;
+	in.download_mode = config.HWDownloadMode;
+
+	const GSBackThreadDecision decision = GSDecideBackThreadMode(in);
+	config.BackThreadModeResolved = decision.mode;
+
+	// A request for the split that does not get it is worth a warning.
+	if (decision.mode != config.BackThreadMode)
+	{
+		Console.Warning("GS: back thread %s, not pipelined (%s).", GSBackThreadModeName(decision.mode),
+			GSBackThreadReasonText(decision.reason));
+	}
+	else
+	{
+		Console.WriteLn("GS: back thread %s (%s).", GSBackThreadModeName(decision.mode),
+			GSBackThreadReasonText(decision.reason));
+	}
+}
+
 // GV7-1d-ii: the front parser object of the two-object split (GSState.h).
 // Non-null only when GSBackThreadMode::Pipelined engaged; all GIF-parse entry
 // points below route to it, while draw/present/TC stay on g_gs_renderer.
@@ -248,12 +330,17 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 
 	GSVertexSW::InitStatic();
 
+	GSResolveBackThreadMode(GSConfig, renderer);
+
 	if (renderer == GSRendererType::Null)
 	{
 		g_gs_renderer = std::make_unique<GSRendererNull>();
 	}
 	else if (renderer != GSRendererType::SW)
 	{
+		// NullHW lands here too (paired with GSDeviceNone via GetAPIForRenderer above): it is
+		// neither Null nor SW, so it gets the real GSRendererHW object, just with no GPU behind
+		// the device it talks to.
 		// Verify-by-effect for measurement harnesses: a scorer should not trust the command
 		// line about which renderer a run used. It can read this line out of the emulog and
 		// refuse a run whose identity does not match what it asked for; without it a
@@ -261,6 +348,7 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 		Console.WriteLn("GS: Classic renderer active (renderer=%s)",
 			Pcsx2Config::GSOptions::GetRendererName(renderer));
 		GSClampUpscaleMultiplier(GSConfig);
+		GSApplyCopyRoadBlendingCap(GSConfig);
 		g_gs_renderer = std::make_unique<GSRendererHW>();
 	}
 	else
@@ -273,10 +361,10 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 	g_gs_renderer->UpdateRenderFixes();
 
 	// GV7-1d-ii: instantiate the front parser only when the back thread really
-	// engaged (the renderer ctor falls back to inline records on a non-Vulkan
-	// HW device). An EE-thread read of *live* local memory forces single-object
-	// (lockstep) — see below for why that is not every EE-thread read.
-	if (GSConfig.BackThreadMode == GSBackThreadMode::Pipelined && g_gs_renderer->IsBackThreadRunning())
+	// engaged. GSResolveBackThreadMode has already turned a pipelined request into
+	// Off where it cannot pipeline (a non-Vulkan HW device, Unsynchronized
+	// downloads); the check below is what remains of the original refusal.
+	if (GSConfig.BackThreadModeResolved == GSBackThreadMode::Pipelined && g_gs_renderer->IsBackThreadRunning())
 	{
 		// Which thread performs the readback is the wrong question here; what it reads is the
 		// right one. Unsynchronized takes GS local memory directly, with no lock and no drain,
@@ -290,7 +378,9 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 		// The one exception is a shadow that never came up — ReadLocalMemoryUnsync then falls
 		// back to live local memory, which is exactly the Unsynchronized hazard, now against a
 		// concurrently drawing back thread. The renderer is already constructed at this point,
-		// so its shadow state is the thing to ask.
+		// so its shadow state is the thing to ask. (Its constructor allocates the shadow and
+		// marks it ready, so this is a guard, not a road: Unsynchronized itself never reaches
+		// here.)
 		const bool ee_thread_reads_live_memory =
 			GSConfig.HWDownloadMode == GSHardwareDownloadMode::Unsynchronized ||
 			(GSConfig.HWDownloadMode == GSHardwareDownloadMode::Asynchronous &&
@@ -970,6 +1060,9 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 {
 	Pcsx2Config::GSOptions old_config(std::move(GSConfig));
 	GSConfig = new_config;
+	// The resolved back-thread mode belongs to the open renderer. A changed request reopens it
+	// below (BackThreadMode is a restart option), which resolves again.
+	GSConfig.BackThreadModeResolved = old_config.BackThreadModeResolved;
 	if (!g_gs_renderer)
 		return;
 
@@ -996,6 +1089,10 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 
 	// Ensure upscale multiplier is in range.
 	GSClampUpscaleMultiplier(GSConfig);
+
+	// GSConfig was just replaced wholesale, so the cap has to be re-derived; old_config carries
+	// the previous run's capped value and new_config carries none.
+	GSApplyCopyRoadBlendingCap(GSConfig);
 
 	// Options which aren't using the global struct yet, so we need to recreate all GS objects.
 	if (GSConfig.SWExtraThreads != old_config.SWExtraThreads ||

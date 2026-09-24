@@ -725,8 +725,9 @@ static __fi u32 psxScaleBlockCycles()
 	return s_psxBlockCycles;
 }
 
-// Contract: updates RPSXEECYCLE in place (callers test it against 0 for the
-// timeslice exit) and must not clobber RPSXCYCLE.
+// Contract: updates RPSXEECYCLE in place and leaves the flags of the
+// subtraction that produced it, so a caller's timeslice exit is a bare b.le
+// with nothing between. Must not clobber RPSXCYCLE.
 static void iPsxAddEECycles(u32 blockCycles)
 {
 	if (!(psxHu32(HW_ICFG) & (1 << 3))) [[likely]]
@@ -736,17 +737,17 @@ static void iPsxAddEECycles(u32 blockCycles)
 		if (blockCycles != 0xFFFFFFFF)
 		{
 			if (blockCycles * 8 < 4096)
-				armAsm->Sub(RPSXEECYCLE, RPSXEECYCLE, blockCycles * 8);
+				armAsm->Subs(RPSXEECYCLE, RPSXEECYCLE, blockCycles * 8);
 			else
 			{
 				armAsm->Mov(a64::w1, blockCycles * 8);
-				armAsm->Sub(RPSXEECYCLE, RPSXEECYCLE, a64::w1);
+				armAsm->Subs(RPSXEECYCLE, RPSXEECYCLE, a64::w1);
 			}
 		}
 		else
 		{
 			// blockCycles in w0 (from wait loop optimization)
-			armAsm->Sub(RPSXEECYCLE, RPSXEECYCLE, a64::w0);
+			armAsm->Subs(RPSXEECYCLE, RPSXEECYCLE, a64::w0);
 		}
 		return;
 	}
@@ -770,7 +771,7 @@ static void iPsxAddEECycles(u32 blockCycles)
 	armAsm->Udiv(a64::w3, a64::w0, a64::w1);            // w3 = (in+carry) / cdenom
 	armAsm->Msub(a64::w1, a64::w3, a64::w1, a64::w0);   // w1 = remainder
 	armAsm->Str(a64::w1, armPsxRegMem(&psxRegs.iopCycleEECarry));
-	armAsm->Sub(RPSXEECYCLE, RPSXEECYCLE, a64::w3);
+	armAsm->Subs(RPSXEECYCLE, RPSXEECYCLE, a64::w3);
 }
 
 static void iPsxBranchTest(u32 newpc, u32 cpuBranch)
@@ -813,7 +814,6 @@ static void iPsxBranchTest(u32 newpc, u32 cpuBranch)
 		// Subtract consumed cycles from iopCycleEE
 		iPsxAddEECycles(0xFFFFFFFF); // uses w0 as the cycle count
 
-		armAsm->Cmp(RPSXEECYCLE, 0);
 		armEmitCondBranch(a64::le, iopExitRecompiledCode);
 
 		// Call event test
@@ -845,7 +845,6 @@ static void iPsxBranchTest(u32 newpc, u32 cpuBranch)
 
 		// Subtract from iopCycleEE — exit if <= 0
 		iPsxAddEECycles(blockCycles);
-		armAsm->Cmp(RPSXEECYCLE, 0);
 		armEmitCondBranch(a64::le, iopExitRecompiledCode);
 
 		// Check if event is pending: cycle >= iopNextEventCycle

@@ -219,7 +219,6 @@ final class SettingsStore {
     static let shadeBoostRange = 1...100
     static let casSharpnessRange = 0...100
     static let cpuSpriteRenderBwRange = 0...10
-    static let targetFPSRange = Int(minTargetFPS)...Int(maxTargetFPS)
     static let defaultOsdPerformancePosition = 3
     static let emulationOnlyModeDelayRange = 0...15
     static let defaultEmulationOnlyModeDelaySeconds = 5
@@ -465,13 +464,13 @@ final class SettingsStore {
     var eeClampMode: Int {
         didSet {
             guard !suppressINIWrites else { return }
-            Self.applyEEClampMode(Self.clampedClampMode(eeClampMode))
+            Self.applyEEClampMode(Self.clamped(eeClampMode, to: 0...3))
         }
     }
     var vuClampMode: Int {
         didSet {
             guard !suppressINIWrites else { return }
-            Self.applyVUClampMode(Self.clampedClampMode(vuClampMode))
+            Self.applyVUClampMode(Self.clamped(vuClampMode, to: 0...3))
         }
     }
     var frameLimiterEnabled: Bool {

@@ -440,6 +440,7 @@ static const char* s_gs_hw_fix_names[] = {
 	"gpuPaletteConversion",
 	"minimumBlendingLevel",
 	"maximumBlendingLevel",
+	"copyRoadMaximumBlendingLevel",
 	"recommendedBlendingLevel",
 	"recommendedAccurateAlphaTest",
 	"recommendedHWAA1",
@@ -476,6 +477,7 @@ bool GameDatabaseSchema::isUserHackHWFix(GSHWFixId id)
 		case GSHWFixId::TrilinearFiltering:
 		case GSHWFixId::MinimumBlendingLevel:
 		case GSHWFixId::MaximumBlendingLevel:
+		case GSHWFixId::CopyRoadMaximumBlendingLevel:
 		case GSHWFixId::RecommendedBlendingLevel:
 		case GSHWFixId::PCRTCOffsets:
 		case GSHWFixId::PCRTCOverscan:
@@ -832,6 +834,12 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
 		case GSHWFixId::MaximumBlendingLevel:
 			return (static_cast<int>(config.AccurateBlendingUnit) <= value);
 
+		case GSHWFixId::CopyRoadMaximumBlendingLevel:
+			// The cap is a ceiling the GS applies later, and only on the roads that charge for a
+			// destination read, so a player already at or below it has nothing left for this fix
+			// to do, on any device.
+			return (static_cast<int>(config.AccurateBlendingUnit) <= value);
+
 		case GSHWFixId::RecommendedBlendingLevel:
 			return true;
 
@@ -1104,6 +1112,17 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 			}
 			break;
 
+			case GSHWFixId::CopyRoadMaximumBlendingLevel:
+			{
+				// Recorded, not applied. Whether the cap bites depends on how the device serves a
+				// render-target self-read, and that is not known here -- the GS device may not
+				// exist yet, and it is the GS thread's to read when it does. So the value rides to
+				// GSConfig and GS.cpp asks GSCopyRoadBlendingPolicy.h once the device is up.
+				if (value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum))
+					config.CopyRoadMaximumBlendingLevel = static_cast<s8>(value);
+			}
+			break;
+
 			case GSHWFixId::RecommendedBlendingLevel:
 			{
 				if (quiet)
@@ -1226,6 +1245,57 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 	{
 		Host::RemoveKeyedOSDMessage("HWFixesWarning");
 	}
+}
+
+std::vector<GameDatabaseSchema::GameEntry::ClaimableSetting> GameDatabaseSchema::GameEntry::claimableSettings() const
+{
+	std::vector<ClaimableSetting> out;
+
+	// Names match the labels applyGameFixes() logs, so the list and a log line read together.
+	const auto add_knob = [&out](CoreGameDBKnob knob, const char* name, int value) {
+		const PerGameOverrideKeys::CoreKnobKeys keys = PerGameOverrideKeys::ForCoreKnob(knob);
+		if (!keys.section)
+			return;
+
+		ClaimableSetting& setting = out.emplace_back(ClaimableSetting{name, value, true, false, {}});
+		for (u32 i = 0; i < keys.count; i++)
+			setting.keys.emplace_back(keys.section, keys.keys[i]);
+	};
+
+	if (eeRoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::EERoundMode, "eeRoundMode", static_cast<int>(eeRoundMode));
+	if (eeDivRoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::EEDivRoundMode, "eeDivRoundMode", static_cast<int>(eeDivRoundMode));
+	if (vu0RoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::VU0RoundMode, "vu0RoundMode", static_cast<int>(vu0RoundMode));
+	if (vu1RoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::VU1RoundMode, "vu1RoundMode", static_cast<int>(vu1RoundMode));
+	if (eeClampMode != ClampMode::Undefined)
+		add_knob(CoreGameDBKnob::EEClampMode, "eeClampMode", enum_cast(eeClampMode));
+	if (vu0ClampMode != ClampMode::Undefined)
+		add_knob(CoreGameDBKnob::VU0ClampMode, "vu0ClampMode", enum_cast(vu0ClampMode));
+	if (vu1ClampMode != ClampMode::Undefined)
+		add_knob(CoreGameDBKnob::VU1ClampMode, "vu1ClampMode", enum_cast(vu1ClampMode));
+
+	for (const auto& [hack, value] : speedHacks)
+	{
+		if (const char* key = PerGameOverrideKeys::ForSpeedHack(hack))
+			out.push_back({Pcsx2Config::SpeedhackOptions::GetSpeedHackName(hack), value, true, false, {{"EmuCore/Speedhacks", key}}});
+	}
+
+	for (const GamefixId id : gameFixes)
+	{
+		if (const char* key = PerGameOverrideKeys::ForGamefix(id))
+			out.push_back({Pcsx2Config::GamefixOptions::GetGameFixName(id), 1, true, false, {{"EmuCore/Gamefixes", key}}});
+	}
+
+	for (const auto& [id, value] : gsHWFixes)
+	{
+		if (const char* key = PerGameOverrideKeys::ForGSHWFix(id))
+			out.push_back({getHWFixName(id), value, false, isUserHackHWFix(id), {{"EmuCore/GS", key}}});
+	}
+
+	return out;
 }
 
 void GameDatabase::loadFile(const std::string& path, const std::string& name, bool is_override)

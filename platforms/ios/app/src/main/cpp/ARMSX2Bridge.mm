@@ -65,7 +65,6 @@ extern "C" void ARMSX2_iOSCopyDeviceStats(int* outBatteryPercent, int* outTherma
 #include "common/Path.h"
 #include "common/ZipHelpers.h"
 #include "common/Error.h"
-#include "common/MRCHelpers.h"
 
 #include <algorithm>
 #include <array>
@@ -129,19 +128,6 @@ static void ARMSX2FlushINISave()
 static NSDate* s_lastNVMSaveDate = nil;
 static ARMSX2RetroAchievementsToastInfo* s_pendingRetroAchievementsNotification = nil;
 
-// This file has no ARC, so a static holding an object has to own it. Both writers below
-// are handed autoreleased objects, and a raw assignment leaves the static pointing at
-// freed memory once the pool drains.
-static void ARMSX2SetLastNVMSaveDate(NSDate* date)
-{
-#if __has_feature(objc_arc)
-    s_lastNVMSaveDate = date;
-#else
-    [s_lastNVMSaveDate release];
-    s_lastNVMSaveDate = [date retain];
-#endif
-}
-
 @implementation ARMSX2SaveStateSlotInfo
 @end
 
@@ -149,36 +135,7 @@ static void ARMSX2SetLastNVMSaveDate(NSDate* date)
 @end
 
 @implementation ARMSX2RetroAchievementsToastInfo
-#if !__has_feature(objc_arc)
-- (void)dealloc
-{
-    [_title release];
-    [_message release];
-    [_badgePath release];
-    [super dealloc];
-}
-#endif
 @end
-
-static void ARMSX2SetPendingRetroAchievementsNotification(ARMSX2RetroAchievementsToastInfo* toast)
-{
-#if __has_feature(objc_arc)
-    s_pendingRetroAchievementsNotification = toast;
-#else
-    [s_pendingRetroAchievementsNotification release];
-    s_pendingRetroAchievementsNotification = [toast retain];
-#endif
-}
-
-static void ARMSX2ClearPendingRetroAchievementsNotification()
-{
-#if __has_feature(objc_arc)
-    s_pendingRetroAchievementsNotification = nil;
-#else
-    [s_pendingRetroAchievementsNotification release];
-    s_pendingRetroAchievementsNotification = nil;
-#endif
-}
 
 static constexpr int ARMSX2UseGlobalIntSentinel = -1;
 // "Use global" markers. Out of band for their ranges: upscale is positive, the int keys start
@@ -324,10 +281,7 @@ extern "C" void ARMSX2_PostRetroAchievementsNotification(const char* title, cons
         toast.message = messageString;
         toast.badgePath = badgePathString;
         toast.duration = durationNumber != nil ? durationNumber.doubleValue : 0.0;
-        ARMSX2SetPendingRetroAchievementsNotification(toast);
-#if !__has_feature(objc_arc)
-        [toast release];
-#endif
+        s_pendingRetroAchievementsNotification = toast;
 
         [[NSNotificationCenter defaultCenter] postNotificationName:@"ARMSX2RetroAchievementsNotification"
                                                            object:nil];
@@ -867,6 +821,8 @@ static MemoryCardFileType ARMSX2MemoryCardFileTypeForSizeMB(NSInteger sizeMB)
 
 static NSData* ARMSX2ReadSaveStatePreviewPNG(const std::string& path)
 {
+    static const zip_uint64_t kMaxPreviewBytes = 8 * 1024 * 1024;
+
     if (path.empty())
         return nil;
 
@@ -880,7 +836,7 @@ static NSData* ARMSX2ReadSaveStatePreviewPNG(const std::string& path)
         return nil;
 
     std::optional<std::vector<u8>> data = ReadBinaryFileInZip(zff.get());
-    if (!data.has_value() || data->empty())
+    if (!data.has_value() || data->empty() || data->size() > kMaxPreviewBytes)
         return nil;
 
     return [NSData dataWithBytes:data->data() length:data->size()];
@@ -1014,7 +970,7 @@ static NSInteger ARMSX2BackupAssignedMemoryCards(const char* reason, s32 stateSl
 static bool ARMSX2FlushNVRAMAndMemoryCards(const char* reason)
 {
     cdvdSaveNVRAM();
-    ARMSX2SetLastNVMSaveDate([NSDate date]);
+    s_lastNVMSaveDate = [NSDate date];
 
     if (!VMManager::HasValidVM()) {
         NSLog(@"[ARMSX2Bridge] Save-state flush skipped memory cards reason=%s validVM=0",
@@ -1199,7 +1155,7 @@ static NSMutableDictionary<NSString*, id>* ARMSX2BuildGlobalGameSettingsResult()
         g_p44_settings_interface ? g_p44_settings_interface->GetIntValue("SPU2/Output", "StandardVolume", ARMSX2DefaultAudioVolumePercent) : ARMSX2DefaultAudioVolumePercent,
         0,
         ARMSX2DefaultAudioVolumePercent);
-    return [[@{
+    return [@{
         @"enabled": @NO,
         @"path": @"",
         @"serial": @"",
@@ -1252,7 +1208,7 @@ static NSMutableDictionary<NSString*, id>* ARMSX2BuildGlobalGameSettingsResult()
         @"globalVolumePercent": @(globalVolumePercent),
         @"volumePercent": @(globalVolumePercent),
         @"hasVolumeOverride": @NO,
-    } mutableCopy] autorelease];
+    } mutableCopy];
 }
 
 // Overlays per-game INI overrides for the given serial/crc onto a globals-seeded result.
@@ -2087,7 +2043,6 @@ static BOOL ARMSX2IsShaderPackImportName(NSString* name)
     static NSSet<NSString*>* allowed;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // This file is MRC, so the set is allocated rather than autoreleased.
         allowed = [[NSSet alloc] initWithArray:@[@"slangp", @"slang", @"glslp", @"glsl", @"cgp",
                                                  @"cg", @"inc", @"h", @"params", @"png", @"jpg",
                                                  @"jpeg", @"tga", @"bmp", @"txt", @"md"]];
@@ -2144,7 +2099,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 
 + (void)saveAllState {
     cdvdSaveNVRAM();
-    ARMSX2SetLastNVMSaveDate([NSDate date]);
+    s_lastNVMSaveDate = [NSDate date];
     Host::RunOnCPUThread([]() {
         const bool flushed = ARMSX2FlushNVRAMAndMemoryCards("manual-save-all-state");
         NSLog(@"[ARMSX2Bridge] Memory card save requested result=%d", flushed ? 1 : 0);
@@ -2348,8 +2303,9 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
         if (!file)
             continue;
 
+        const zip_uint64_t entryCap = ARMSX2IsControllerSkinImageName(entryName) ? kMaxSkinArchiveEntryBytes : kMaxLooseLayoutBytes;
         std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-        if (!data.has_value() || data->empty())
+        if (!data.has_value() || data->empty() || data->size() > entryCap)
             continue;
 
         NSString *safeName = ARMSX2SanitizedSkinFileName(entryName);
@@ -2532,6 +2488,8 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 }
 
 + (nullable NSData *)peekSkinManifestDataAtURL:(NSURL *)archiveURL {
+    static const zip_uint64_t kMaxManifestBytes = 16 * 1024 * 1024;
+
     if (!archiveURL.isFileURL) {
         return nil;
     }
@@ -2564,7 +2522,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
             if (![entryName.lastPathComponent.lowercaseString isEqualToString:wanted]) {
                 continue;
             }
-            if ((stat.valid & ZIP_STAT_SIZE) && stat.size > 16 * 1024 * 1024) {
+            if ((stat.valid & ZIP_STAT_SIZE) && stat.size > kMaxManifestBytes) {
                 continue;
             }
             auto file = zip_fopen_index_managed(zf.get(), i, ZIP_FL_ENC_GUESS);
@@ -2572,7 +2530,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
                 continue;
             }
             std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-            if (!data.has_value() || data->empty()) {
+            if (!data.has_value() || data->empty() || data->size() > kMaxManifestBytes) {
                 continue;
             }
             return [NSData dataWithBytes:data->data() length:data->size()];
@@ -2692,7 +2650,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
             continue;
         }
         std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-        if (!data.has_value() || data->empty()) {
+        if (!data.has_value() || data->empty() || data->size() > kMaxPackageEntryBytes) {
             continue;
         }
 
@@ -2759,7 +2717,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
         if (!file)
             continue;
         std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-        if (!data.has_value() || data->empty())
+        if (!data.has_value() || data->empty() || data->size() > kMaxMemcardEntryBytes)
             continue;
 
         NSString *destinationPath = [memcardDir stringByAppendingPathComponent:safeName];
@@ -2779,7 +2737,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 }
 
 + (nullable NSString *)currentISOPath {
-    NSString *docsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *docsPath = [self documentsDirectory];
     NSString *iniPath = [docsPath stringByAppendingPathComponent:@"ARMSX2-iOS.ini"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:iniPath])
         iniPath = [docsPath stringByAppendingPathComponent:@"PCSX2-iOS.ini"];
@@ -2823,7 +2781,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 }
 
 + (nonnull NSString *)isoDirectory {
-    NSString *docsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *docsPath = [self documentsDirectory];
     NSString *isoDir = [docsPath stringByAppendingPathComponent:@"iso"];
     [[NSFileManager defaultManager] createDirectoryAtPath:isoDir withIntermediateDirectories:YES attributes:nil error:nil];
     return isoDir;
@@ -2866,7 +2824,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
         [isos addObject:relativeName];
         [seen addObject:relativeName];
     });
-    NSString *docsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *docsPath = [self documentsDirectory];
     scanDir(docsPath);
 
 	return isos;
@@ -3044,10 +3002,6 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
     if (isoName.length == 0 || ARMSX2PathIsRunningDisc(ARMSX2ResolveISOPath(isoName))) {
         ARMSX2RequestPerGameSettingsReload();
     }
-}
-
-+ (void)setGameSettingsForCurrentGame:(nonnull NSDictionary<NSString *, id> *)settings {
-    [self setGameSettings:settings forISO:nil];
 }
 
 
@@ -3298,7 +3252,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 + (void)releaseNonEmulationResources:(NSUInteger)releaseFlags {
     if (releaseFlags & VMManager::EMULATION_ONLY_RELEASE_ACHIEVEMENTS) {
         void (^clearPendingNotification)(void) = ^{
-            ARMSX2ClearPendingRetroAchievementsNotification();
+            s_pendingRetroAchievementsNotification = nil;
         };
         if ([NSThread isMainThread])
             clearPendingNotification();
@@ -3452,7 +3406,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 #pragma mark - BIOS management
 
 + (nonnull NSString *)biosDirectory {
-    NSString *docsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *docsPath = [self documentsDirectory];
     NSString *biosDir = [docsPath stringByAppendingPathComponent:@"bios"];
     [[NSFileManager defaultManager] createDirectoryAtPath:biosDir withIntermediateDirectories:YES attributes:nil error:nil];
     return biosDir;
@@ -3665,7 +3619,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 + (BOOL)isMetalFXSupported {
 #if ARMSX2_HAS_METALFX
 	if (@available(iOS 16.0, *)) {
-		MRCOwned<id<MTLDevice>> device = MRCTransfer(MTLCreateSystemDefaultDevice());
+		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 		if (!device)
 			return NO;
 		return [MTLFXSpatialScalerDescriptor supportsDevice:device];
@@ -3891,6 +3845,14 @@ static void ARMSX2MutatePerGameINI(NSString* isoName, NSString* section, NSStrin
     });
 }
 
++ (nullable NSNumber *)perGameINIBoolIfPresent:(nonnull NSString *)section key:(nonnull NSString *)key forISO:(nullable NSString *)isoName {
+    return ARMSX2ReadPerGameINI<NSNumber*>(isoName, nil, [&](const INISettingsInterface& si) -> NSNumber* {
+        if (!si.ContainsValue(section.UTF8String, key.UTF8String))
+            return nil;
+        return @(si.GetBoolValue(section.UTF8String, key.UTF8String, false));
+    });
+}
+
 + (int)getPerGameINIInt:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(int)def forISO:(nullable NSString *)isoName {
     return ARMSX2ReadPerGameINI(isoName, def, [&](const INISettingsInterface& si) {
         return si.GetIntValue(section.UTF8String, key.UTF8String, def);
@@ -3950,40 +3912,8 @@ static void ARMSX2MutatePerGameINI(NSString* isoName, NSString* section, NSStrin
     return [self hasPerGameINIValue:section key:key forISO:nil];
 }
 
-+ (int)getPerGameINIIntForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(int)def {
-    return [self getPerGameINIInt:section key:key defaultValue:def forISO:nil];
-}
-
 + (BOOL)getPerGameINIBoolForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(BOOL)def {
     return [self getPerGameINIBool:section key:key defaultValue:def forISO:nil];
-}
-
-+ (float)getPerGameINIFloatForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(float)def {
-    return [self getPerGameINIFloat:section key:key defaultValue:def forISO:nil];
-}
-
-+ (nonnull NSString *)getPerGameINIStringForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(nonnull NSString *)def {
-    return [self getPerGameINIString:section key:key defaultValue:def forISO:nil];
-}
-
-+ (void)setPerGameINIIntForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(int)value {
-    [self setPerGameINIInt:section key:key value:value forISO:nil];
-}
-
-+ (void)setPerGameINIBoolForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(BOOL)value {
-    [self setPerGameINIBool:section key:key value:value forISO:nil];
-}
-
-+ (void)setPerGameINIFloatForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(float)value {
-    [self setPerGameINIFloat:section key:key value:value forISO:nil];
-}
-
-+ (void)setPerGameINIStringForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(nonnull NSString *)value {
-    [self setPerGameINIString:section key:key value:value forISO:nil];
-}
-
-+ (void)deletePerGameINIValueForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key {
-    [self deletePerGameINIValue:section key:key forISO:nil];
 }
 
 + (nonnull NSString *)perGameIdentityKeyForISO:(nullable NSString *)isoName {
@@ -3996,6 +3926,21 @@ static void ARMSX2MutatePerGameINI(NSString* isoName, NSString* section, NSStrin
 
 + (nonnull NSString *)perGameIdentityKeyForCurrentGame {
     return [self perGameIdentityKeyForISO:nil];
+}
+
++ (nullable NSDictionary<NSString *, NSString *> *)perGameIdentityForCurrentGame {
+    if (!VMManager::HasValidVM())
+        return nil;
+    std::string serial;
+    u32 crc = 0;
+    // Matches what gameSettingsForCurrentGame leaves in the dictionary when the
+    // identity is not resolvable: the globals-seeded blanks, not the partial serial.
+    if (!ARMSX2PerGameIdentityForCurrentGame(&serial, &crc))
+        return @{@"serial": @"", @"crc": @""};
+    return @{
+        @"serial": ARMSX2NSStringFromStdString(serial),
+        @"crc": [NSString stringWithFormat:@"%08X", crc],
+    };
 }
 
 + (int)limiterMode
@@ -4393,19 +4338,11 @@ extern "C" void ARMSX2_ApplyEffectivePresentFPSCap(void)
     return ARMSX2PatchEnableListForIdentity(serial, crc, section, key);
 }
 
-+ (NSArray<NSString *> *)patchEnableListForCurrentGameSection:(NSString *)section key:(NSString *)key {
-    return [self patchEnableListForISO:nil section:section key:key];
-}
-
 + (void)setPatchEnableList:(NSArray<NSString *> *)values forISO:(nullable NSString *)isoName section:(NSString *)section key:(NSString *)key {
     std::string serial;
     u32 crc = 0;
     if (!ARMSX2PerGameIdentityForISO(isoName, &serial, &crc)) return;
     ARMSX2SetPatchEnableListForIdentity(values, serial, crc, section, key);
-}
-
-+ (void)setPatchEnableListForCurrentGame:(NSArray<NSString *> *)values section:(NSString *)section key:(NSString *)key {
-    [self setPatchEnableList:values forISO:nil section:section key:key];
 }
 
 #pragma mark - Memory cards
@@ -4718,10 +4655,6 @@ extern "C" void ARMSX2_ApplyEffectivePresentFPSCap(void)
 + (nullable ARMSX2RetroAchievementsToastInfo *)consumePendingRetroAchievementsNotification {
     __block ARMSX2RetroAchievementsToastInfo* pending = nil;
     void (^consume)(void) = ^{
-        // Hands the static's reference to `pending`, which is why this clears the pointer
-        // by hand instead of calling ARMSX2ClearPendingRetroAchievementsNotification().
-        // That one releases, and the autorelease at the end of this function is already
-        // paying for the reference. Using it here would over-release.
         pending = s_pendingRetroAchievementsNotification;
         s_pendingRetroAchievementsNotification = nil;
     };
@@ -4732,11 +4665,7 @@ extern "C" void ARMSX2_ApplyEffectivePresentFPSCap(void)
         dispatch_sync(dispatch_get_main_queue(), consume);
     }
 
-#if __has_feature(objc_arc)
     return pending;
-#else
-    return [pending autorelease];
-#endif
 }
 
 + (BOOL)isRetroAchievementsHardcoreActive {
