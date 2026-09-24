@@ -274,6 +274,13 @@ int main() {
 endfunction()
 
 function(detect_cache_line_size)
+	# Same escape hatch as detect_page_size: pre-set HOST_CACHE_LINE_SIZE (e.g.
+	# -DHOST_CACHE_LINE_SIZE=64) to skip the probe. Cross-compiling needs it, since
+	# the try_run below is fatal there.
+	if(DEFINED HOST_CACHE_LINE_SIZE)
+		message(STATUS "Host cache line size (preset): ${HOST_CACHE_LINE_SIZE}")
+		return()
+	endif()
 	message(STATUS "Determining host cache line size")
 	set(detect_cache_line_size_file ${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/CMakeTmp/src.c)
 	file(WRITE ${detect_cache_line_size_file} "
