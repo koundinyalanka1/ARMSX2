@@ -2317,6 +2317,11 @@ RETRO_API void retro_unload_game(void)
 #endif
 	LibretroCore::s_context_ready.store(false, std::memory_order_release);
 	LibretroCore::s_cpu_thread_initialized.store(false, std::memory_order_release);
+
+	// Here as well as in retro_load_game: a frontend that asks for the av info
+	// before loading the next game should get the defaults, not the rate and
+	// size this one ended on.
+	LibretroCore::s_presented = {};
 }
 
 RETRO_API void retro_run(void)
