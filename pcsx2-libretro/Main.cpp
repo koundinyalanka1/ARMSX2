@@ -138,6 +138,25 @@ namespace LibretroCore
 	static bool s_hw_render_gl = false;
 	static std::atomic<bool> s_cpu_thread_initialized{false};
 	static std::atomic<bool> s_context_ready{false};
+
+	// What the frontend was last told about the picture and the frame rate.
+	// Per content, not per process: retro_load_game resets it, because that is
+	// when the frontend resets its own side from retro_get_system_av_info. A
+	// core kept loaded across a game change (RetroArch's close + load, or a
+	// host whose dlclose does not unmap it) would otherwise skip announcing a
+	// value that merely matches what the previous game ended on - a PAL game
+	// after a PAL game would run at the 59.94 the frontend was just given.
+	struct PresentedState
+	{
+		double fps = 59.94;
+		// Last SET_GEOMETRY; zero until one has been sent.
+		u32 geometry_width = 0;
+		u32 geometry_height = 0;
+		// Last real frame, which a duplicate repeats the size of.
+		u32 frame_width = kFrameWidth;
+		u32 frame_height = kFrameHeight;
+	};
+	static PresentedState s_presented;
 } // namespace LibretroCore
 
 // Settings persistence (INI under the frontend's system directory).
@@ -1755,7 +1774,21 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info)
 	info->geometry.max_height = VKLibretro::kMaxCanvasHeight;
 #endif
 	info->geometry.aspect_ratio = 4.0f / 3.0f;
-	info->timing.fps = 59.94;
+
+	// Once retro_run has announced a picture size or a frame rate, report that
+	// rather than the boot defaults. retro_run builds its SET_SYSTEM_AV_INFO from
+	// this function, so answering with the defaults here would put the frontend
+	// back on 640x448 at 4:3 the moment a PAL game changed the frame rate - while
+	// the frames themselves stay at whatever size SET_GEOMETRY last announced.
+	const LibretroCore::PresentedState& presented = LibretroCore::s_presented;
+	if (presented.geometry_width != 0 && presented.geometry_height != 0)
+	{
+		info->geometry.base_width = presented.geometry_width;
+		info->geometry.base_height = presented.geometry_height;
+		info->geometry.aspect_ratio =
+			static_cast<float>(presented.geometry_width) / static_cast<float>(presented.geometry_height);
+	}
+	info->timing.fps = presented.fps;
 	info->timing.sample_rate = 48000.0;
 }
 
@@ -1861,6 +1894,10 @@ namespace LibretroCore
 
 RETRO_API bool retro_load_game(const struct retro_game_info* game)
 {
+	// The frontend has just taken its picture size and frame rate from
+	// retro_get_system_av_info; start from the same defaults it has.
+	LibretroCore::s_presented = {};
+
 	int format = RETRO_PIXEL_FORMAT_XRGB8888;
 	if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &format))
 	{
@@ -2302,9 +2339,9 @@ RETRO_API void retro_run(void)
 		// duplicates included, and RetroArch computes its integer scaling from
 		// that number rather than from the geometry the core announces. So a
 		// duplicate must not report a different size than the frame it repeats:
-		// the size the last real frame went out at is carried here for it.
-		static u32 last_frame_width = LibretroCore::kFrameWidth;
-		static u32 last_frame_height = LibretroCore::kFrameHeight;
+		// the size the last real frame went out at is carried for it, in
+		// LibretroCore::s_presented.
+		LibretroCore::PresentedState& presented = LibretroCore::s_presented;
 
 		// M2: consume the newest GS frame (if any) and hand it to the
 		// frontend. The retro_vulkan_image storage must outlive this call --
@@ -2316,12 +2353,10 @@ RETRO_API void retro_run(void)
 			// The GS present path sizes the canvas to the (aspect-expanded)
 			// merged frame, so it changes with the internal resolution — keep
 			// the frontend's geometry in sync so scaling stays correct.
-			static u32 last_geometry_width = 0;
-			static u32 last_geometry_height = 0;
-			if (frame.width != last_geometry_width || frame.height != last_geometry_height)
+			if (frame.width != presented.geometry_width || frame.height != presented.geometry_height)
 			{
-				last_geometry_width = frame.width;
-				last_geometry_height = frame.height;
+				presented.geometry_width = frame.width;
+				presented.geometry_height = frame.height;
 				retro_game_geometry geometry = {};
 				geometry.base_width = frame.width;
 				geometry.base_height = frame.height;
@@ -2342,13 +2377,13 @@ RETRO_API void retro_run(void)
 					VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
 				{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 			vulkan->set_image(vulkan->handle, &vkimage, 0, nullptr, vulkan->queue_index);
-			last_frame_width = frame.width;
-			last_frame_height = frame.height;
+			presented.frame_width = frame.width;
+			presented.frame_height = frame.height;
 			video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
 		}
 		else
 		{
-			video_cb(nullptr, last_frame_width, last_frame_height, 0);
+			video_cb(nullptr, presented.frame_width, presented.frame_height, 0);
 		}
 	}
 	else
@@ -2359,8 +2394,7 @@ RETRO_API void retro_run(void)
 		// This thread has the frontend's context current and the GS thread's
 		// context shares its objects, so the texture the GS just published can
 		// be read straight into the frontend's framebuffer.
-		static u32 last_gl_width = LibretroCore::kFrameWidth;
-		static u32 last_gl_height = LibretroCore::kFrameHeight;
+		LibretroCore::PresentedState& presented = LibretroCore::s_presented;
 		GLLibretro::Frame frame;
 		if (s_gl_hw_render.get_current_framebuffer && GLLibretro::ConsumeFrame(&frame))
 		{
@@ -2396,8 +2430,8 @@ RETRO_API void retro_run(void)
 			// frame.width x frame.height of its framebuffer - which is exactly
 			// where a GL blit to (0,0) lands.
 			glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fbo);
-			last_gl_width = frame.width;
-			last_gl_height = frame.height;
+			presented.frame_width = frame.width;
+			presented.frame_height = frame.height;
 			video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
 		}
 		else
@@ -2405,7 +2439,7 @@ RETRO_API void retro_run(void)
 			// Nothing new - still booting, or a duplicate frame. Repeat at the
 			// size the last real one arrived at, so a frontend that scales by
 			// integers does not recompute its viewport in between.
-			video_cb(nullptr, last_gl_width, last_gl_height, 0);
+			video_cb(nullptr, presented.frame_width, presented.frame_height, 0);
 		}
 #endif
 	}
@@ -2421,14 +2455,12 @@ RETRO_API void retro_run(void)
 	// frequency (PAL 50Hz, progressive modes), update the frontend.
 	if (VMManager::HasValidVM())
 	{
-		static float reported_fps = 59.94f;
 		const float fps = VMManager::GetFrameRate();
-		if (fps > 1.0f && std::abs(fps - reported_fps) > 0.25f)
+		if (fps > 1.0f && std::abs(fps - LibretroCore::s_presented.fps) > 0.25)
 		{
-			reported_fps = fps;
+			LibretroCore::s_presented.fps = fps;
 			struct retro_system_av_info av;
 			retro_get_system_av_info(&av);
-			av.timing.fps = fps;
 			environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
 		}
 	}
